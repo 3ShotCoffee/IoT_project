@@ -1,0 +1,16 @@
+# STM32 빌드 결과물 (빌드하면 다시 생김)
+stm32/Debug/
+stm32/Release/
+
+# 파이썬
+__pycache__/
+*.pyc
+eq-env/
+myenv/
+
+# 음악 파일 (용량이 큼)
+*.wav
+*.mp3
+
+# 비밀번호가 들어간 설정 파일
+pi/config.py
