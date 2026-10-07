@@ -1,0 +1,368 @@
+"""실시간 식별에 수동 사용자 등록을 붙인 학습용 예제.
+
+실행:
+    python3 recognize_and_register.py
+    python3 recognize_and_register.py --mqtt
+
+인식 화면에서 등록되지 않은 얼굴이 보이면 r을 눌러 등록을 시작합니다.
+등록 화면에서는 각도를 바꾸고 Space를 눌러 샘플을 저장합니다.
+샘플을 다 모으면 사용하지 않는 ID를 자동 배정합니다. 등록 화면에서 c는 취소,
+인식 화면에서 q는 프로그램 종료입니다.
+"""
+
+import time
+T_START = time.perf_counter()
+print(f"[시간] import: {time.perf_counter() - T_START:.2f}초")
+
+import argparse
+from datetime import datetime
+from pathlib import Path
+import json
+
+import cv2
+import numpy as np
+import onnxruntime as ort
+from insightface.app import FaceAnalysis
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="실시간 얼굴 식별 및 사용자 등록")
+    parser.add_argument("--db-dir", default="image_data", help="user_<ID>.npz 등록 폴더")
+    parser.add_argument("--image-dir", default="image", help="등록 사진 저장 폴더")
+    parser.add_argument("--camera", type=int, default=0, help="웹캠 인덱스")
+    parser.add_argument("--threshold", type=float, default=0.45,
+                        help="코사인 유사도 기준 (임시 시작값, 실제 점수로 조정)")
+    parser.add_argument("--stable-frames", type=int, default=5,
+                        help="같은 ID가 연속 확인되어야 하는 프레임 수")
+    parser.add_argument("--samples", type=int, default=5, help="신규 등록 샘플 수")
+    parser.add_argument("--det-size", type=int, default=320, help="검출 입력 크기")
+    parser.add_argument("--mqtt", action="store_true", help="확정 ID를 MQTT로 발행")
+    parser.add_argument("--broker", default="10.10.16.75", help="MQTT 브로커 주소")
+    parser.add_argument("--port", type=int, default=1883, help="MQTT 포트")
+    parser.add_argument("--topic", default="face/user_id", help="ID 발행 토픽")
+    return parser.parse_args()
+
+
+def load_profiles(directory):
+    """등록 폴더의 user_<ID>.npz 파일들을 읽어 메모리에 준비합니다."""
+    profiles = {}
+    for file_path in sorted(Path(directory).glob("user_*.npz")):
+        try:
+            with np.load(str(file_path), allow_pickle=False) as data:
+                user_id = int(np.asarray(data["user_id"]).item())
+                embedding = np.asarray(data["embedding"], dtype=np.float32).reshape(-1)
+                name = str(np.asarray(data["name"]).item()) if "name" in data else ""
+            norm = np.linalg.norm(embedding)
+            if norm == 0:
+                print("빈 임베딩이라 건너뜁니다: {}".format(file_path))
+                continue
+            profiles[user_id] = {
+                "embedding": embedding / norm,
+                "name": name,
+                "file": str(file_path),
+            }
+            print("등록 프로필: ID={}, 이름={!r}".format(user_id, name))
+        except (OSError, KeyError, ValueError) as exc:
+            print("npz를 읽지 못해 건너뜁니다: {} ({})".format(file_path, exc))
+    return profiles
+
+
+def identify(embedding, profiles, threshold):
+    """현재 임베딩을 등록 프로필과 비교하고 ID와 최고 점수를 반환합니다."""
+    current = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    norm = np.linalg.norm(current)
+    if norm == 0:
+        return -1, 0.0
+    current = current / norm
+
+    best_id = -1
+    best_score = -1.0
+    for user_id, profile in profiles.items():
+        known = profile["embedding"]
+        if current.shape != known.shape:
+            continue
+        # 단위 길이 벡터끼리의 내적은 코사인 유사도입니다.
+        score = float(np.dot(current, known))
+        if score > best_score:
+            best_id, best_score = user_id, score
+
+    if best_score < threshold:
+        return -1, best_score
+    return best_id, best_score
+
+
+def register_user(app, cap, args, user_id):
+    """Space로 여러 샘플을 모아 사진과 새 사용자 npz를 저장합니다."""
+    image_root = Path(args.image_dir) / "user_{}".format(user_id)
+    session = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    photo_dir = image_root / session
+    photo_dir.mkdir(parents=True, exist_ok=False)
+
+    embeddings = []
+    print("새 사용자 ID {} 등록: 얼굴 각도를 바꾸고 Space를 {}번 누르세요. c: 취소".format(
+        user_id, args.samples))
+    try:
+        while len(embeddings) < args.samples:
+            ok, frame = cap.read()
+            if not ok:
+                print("웹캠 프레임을 읽지 못했습니다.")
+                return None
+
+            photo_frame = frame.copy()
+            faces = app.get(frame)
+            face = faces[0] if len(faces) == 1 else None
+            ready = False
+            status = "Show exactly one face"
+            if face is not None:
+                x1, y1, x2, y2 = face.bbox.astype(int)
+                score = float(face.det_score)
+                width, height = x2 - x1, y2 - y1
+                ready = score >= 0.6 and width >= 80 and height >= 80 and has_five_landmarks(face, frame.shape)
+                status = "Ready - move face slowly" if ready else "Face too small / unclear"
+                cv2.rectangle(frame, (x1, y1), (x2, y2),
+                              (0, 220, 0) if ready else (220, 0, 0), 2)
+
+            cv2.putText(frame, status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 255, 0), 2)
+            cv2.putText(frame, "Samples: {}/{}".format(len(embeddings), args.samples),
+                        (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+           # cv2.putText(frame, "SPACE: capture | C: cancel", (16, 90),
+            #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.imshow("User enrollment", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+           # if key == ord("c"):
+            #    print("등록을 취소했습니다. 이번 세션의 사진은 남아 있습니다.")
+            #    return None
+            if key == ord(" "):
+                if not ready:
+                    print("얼굴 한 명이 선명하게 보일 때만 저장할 수 있습니다.")
+                    continue
+                vector = np.asarray(face.normed_embedding, dtype=np.float32)
+                norm = np.linalg.norm(vector)
+                if norm == 0:
+                    print("임베딩이 비어 있어 저장하지 않았습니다.")
+                    continue
+
+                sample_no = len(embeddings) + 1
+                photo_file = photo_dir / "face_{:03d}.jpg".format(sample_no)
+                if cv2.imwrite(str(photo_file), photo_frame):
+                    embeddings.append(vector / norm)
+                    print("샘플 {}/{} 저장".format(len(embeddings), args.samples))
+                else:
+                    print("사진 저장 실패: {}".format(photo_file))
+
+        mean_embedding = np.mean(np.stack(embeddings), axis=0)
+        mean_embedding /= np.linalg.norm(mean_embedding)
+        profile_file = Path(args.db_dir) / "user_{}.npz".format(user_id)
+        np.savez_compressed(
+            str(profile_file),
+            user_id=np.int64(user_id),
+            name=np.asarray("user_{}".format(user_id)),
+            embedding=mean_embedding.astype(np.float32),
+            sample_count=np.int64(len(embeddings)),
+        )
+        print("등록 완료: {}".format(profile_file))
+        print("사진 저장: {}".format(photo_dir))
+        return {
+            "embedding": mean_embedding.astype(np.float32),
+            "name": "user_{}".format(user_id),
+            "file": str(profile_file),
+        }
+    finally:
+        cv2.destroyAllWindows()
+
+
+def make_mqtt_client(host, port):
+    """--mqtt가 있을 때만 브로커에 연결합니다."""
+    try:
+        import paho.mqtt.client as mqtt
+    except ImportError:
+        raise SystemExit("MQTT에는 paho-mqtt가 필요합니다: python -m pip install paho-mqtt")
+
+    def on_connect(client, userdata, flags, rc):
+        if rc == 0:
+            print("MQTT 연결됨: {}:{}".format(host, port))
+        else:
+            print("MQTT 연결 실패, 결과 코드: {}".format(rc))
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1,
+                         client_id="jetson-face-recognizer")
+    client.on_connect = on_connect
+    try:
+        client.connect(host, port, keepalive=30)
+    except OSError as exc:
+        raise SystemExit("MQTT 브로커 {}:{}에 연결할 수 없습니다: {}".format(
+            host, port, exc))
+    client.loop_start()
+    return client, mqtt
+
+
+def publish_user_id(client, mqtt_module, topic, user_id, similarity):
+    payload = json.dumps({
+        "user_id": int(user_id),
+        "similarity": None if similarity is None else float(similarity),
+    })
+    result = client.publish(topic, payload, qos=1, retain=False)
+    if result.rc == mqtt_module.MQTT_ERR_SUCCESS:
+        print("MQTT 발행: topic={!r}, payload={}".format(topic, user_id))
+    else:
+        print("MQTT 발행 실패/대기: rc={}".format(result.rc))
+
+def has_five_landmarks(face, frame_shape):
+    points = getattr(face, "kps", None)
+    if points is None or points.shape != (5, 2):
+        return False
+
+    height, width = frame_shape[:2]
+    return bool(
+        np.isfinite(points).all()
+        and (points[:, 0] >= 0).all()
+        and (points[:, 0] < width).all()
+        and (points[:, 1] >= 0).all()
+        and (points[:, 1] < height).all()
+    )
+
+def main():
+    args = parse_args()
+    if args.samples < 1 or args.stable_frames < 1:
+        raise SystemExit("samples와 stable-frames는 1 이상이어야 합니다.")
+    if not -1.0 <= args.threshold <= 1.0:
+        raise SystemExit("threshold는 -1과 1 사이여야 합니다.")
+
+    db_dir = Path(args.db_dir)
+    db_dir.mkdir(parents=True, exist_ok=True)
+    image_dir = Path(args.image_dir)
+    image_dir.mkdir(parents=True, exist_ok=True)
+    profiles = load_profiles(db_dir)
+
+    available = ort.get_available_providers()
+    if "CUDAExecutionProvider" not in available:
+        raise SystemExit("CUDAExecutionProvider를 사용할 수 없습니다: {}".format(available))
+    t = time.perf_counter()
+    app = FaceAnalysis(name="buffalo_sc", providers=["CUDAExecutionProvider"])
+    print(f"[시간] FaceAnalysis 생성: {time.perf_counter() - t:.2f}초")
+    t = time.perf_counter()
+    app.prepare(ctx_id=0, det_size=(args.det_size, args.det_size))
+    print(f"[시간] app.prepare: {time.perf_counter() - t:.2f}초")
+    
+    mqtt_client = None
+    mqtt_module = None
+    if args.mqtt:
+        mqtt_client, mqtt_module = make_mqtt_client(args.broker, args.port)
+
+    t = time.perf_counter()
+    cap = cv2.VideoCapture(args.camera)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    print(f"[시간] 웹캠 열기: {time.perf_counter() - t:.2f}초")
+    if not cap.isOpened():
+        if mqtt_client is not None:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+        raise SystemExit("웹캠을 열 수 없습니다. --camera 값을 확인하세요.")
+
+    candidate_id = None
+    candidate_count = 0
+    confirmed_id = None
+    read_sum = get_sum = 0.0
+    frame_count = 0
+    loop_start = time.perf_counter()
+    print("실시간 식별 시작. Unknown일 때 r: 등록, q: 종료")
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("웹캠 프레임을 읽지 못했습니다.")
+                break
+
+            t = time.perf_counter()
+            faces = app.get(frame)
+            get_sum += time.perf_counter() - t
+
+            frame_count += 1
+            if frame_count == 30:
+                elapsed = time.perf_counter() - loop_start
+                print(f"[시간] FPS {30 / elapsed:.1f} | "
+                      f"read 평균 {read_sum / 30 * 1000:.0f}ms | "
+                      f"app.get 평균 {get_sum / 30 * 1000:.0f}ms")
+                read_sum = get_sum = 0.0
+                frame_count = 0
+                loop_start = time.perf_counter()
+
+            face = max(
+                faces,
+                key=lambda item: (item.bbox[2] - item.bbox[0]) *
+                                 (item.bbox[3] - item.bbox[1]),
+            ) if faces else None
+
+            best_score = None
+            if face is None:
+                this_candidate = -1
+                status = "No face"
+            else:
+                this_candidate, best_score = identify(
+                    face.normed_embedding, profiles, args.threshold)
+                if this_candidate == -1:
+                    status = "Unknown score={:.3f} | R: enroll".format(best_score)
+                else:
+                    status = "ID {} score={:.3f}".format(this_candidate, best_score)
+                x1, y1, x2, y2 = face.bbox.astype(int)
+                color = (0, 220, 0) if this_candidate != -1 else (0, 0, 255)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            if this_candidate == candidate_id:
+                candidate_count += 1
+            else:
+                candidate_id = this_candidate
+                candidate_count = 1
+
+            # N 프레임 확인된 새 ID일 때만 터미널/MQTT로 한 번 알립니다.
+            if candidate_count >= args.stable_frames and candidate_id != confirmed_id:
+                confirmed_id = candidate_id
+                print("확정 사용자 ID: {}".format(confirmed_id))
+                if mqtt_client is not None:
+                    publish_user_id(
+                        mqtt_client, mqtt_module, args.topic, confirmed_id, best_score)
+
+            cv2.putText(frame, status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 255, 0), 2)
+            cv2.putText(frame, "Stable: {}/{}  Confirmed: {}".format(
+                min(candidate_count, args.stable_frames), args.stable_frames,
+                "-" if confirmed_id is None else confirmed_id),
+                (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.imshow("Identify / enroll", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+
+            # 등록은 실제 얼굴이 화면에 있고 현재 Unknown일 때만 시작합니다.
+            if key == ord("r"):
+                if (
+                    face is None
+                    or this_candidate != -1
+                    or not has_five_landmarks(face, frame.shape)
+                ):
+                    print("유사도가 기준 이하이고 얼굴 기준점 5개가 모두 화면에 있을 때만 등록할 수 있습니다.")
+                    continue
+                new_user_id = max(profiles.keys(), default=-1) + 1
+                while (db_dir / "user_{}.npz".format(new_user_id)).exists():
+                    new_user_id += 1
+                print("새 사용자에게 ID {}를 배정합니다.".format(new_user_id))
+                profile = register_user(app, cap, args, new_user_id)
+                if profile is not None:
+                    profiles[new_user_id] = profile
+                    # 다음 프레임부터 새 프로필과 비교해 안정화 후 ID를 발행합니다.
+                    candidate_id = None
+                    candidate_count = 0
+                    print("ID {} 등록됨. 인식 화면으로 돌아갑니다.".format(new_user_id))
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if mqtt_client is not None:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+
+
+if __name__ == "__main__":
+    main()
