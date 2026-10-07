@@ -4,6 +4,8 @@ STM32 엔코더 + 젯슨 얼굴 인식 연동 실시간 EQ 재생 (scipy 버전,
   (B1=저음, B2=중음, B3=고음, B4=볼륨 / 한 칸 = STEP_DB 만큼)
 - 젯슨이 MQTT(face/user_id)로 보내는 {"user_id": 1, "name": "user_01"}을 받아
   사용자가 바뀌면 DB에서 그 사람의 EQ를 불러와 적용 (DB에 없으면 기본 EQ)
+- 노브(또는 키보드)로 EQ를 바꾸고 SAVE_DELAY초 동안 추가 조절이 없으면
+  현재 사용자의 EQ를 DB에 저장 (DB에 없던 사용자는 새로 추가됨)
 - 키보드 입력도 그대로 사용 가능 (테스트용)
 - 재생 중 터미널에 "low 3", "mid -2", "high 6" 처럼 입력하면 해당 밴드가 바뀜
 - "vol -3", "vol 3" 처럼 입력하면 전체 볼륨이 dB 단위로 바뀜, "mute"로 음소거/해제
@@ -25,7 +27,7 @@ import sounddevice as sd
 from scipy.io import wavfile
 from scipy.signal import sosfilt
 
-from db import load_eq              # 같은 폴더의 db.py
+from db import load_eq, save_eq     # 같은 폴더의 db.py
 
 # ---------------- 설정값 ----------------
 SONG = "song.wav"
@@ -45,6 +47,9 @@ ENCODER_MAP = {1: "low", 2: "mid", 3: "high", 4: "vol"}   # 엔코더 번호 -> 
 MQTT_HOST = "localhost"        # 브로커(Mosquitto)가 이 라즈베리파이에 있으면 localhost
 MQTT_PORT = 1883
 MQTT_TOPIC = "face/user_id"    # 젯슨이 사용자 정보를 올리는 토픽
+
+# 조절이 멈춘 뒤 몇 초 후에 저장할지 (노브를 돌리는 도중에 매번 저장하지 않도록)
+SAVE_DELAY = 1.5
 
 # DB에 없는 사용자에게 적용할 기본 EQ
 DEFAULT_EQ = {"low": 0.0, "mid": 0.0, "high": 0.0, "vol": VOL_START_DB}
@@ -131,6 +136,11 @@ current_vol = target_vol            # 콜백이 지금 쓰고 있는 배율
 
 # ---------------- 사용자 상태 ----------------
 current_user_id = None         # 지금 적용 중인 사용자 번호 (처음엔 아무도 없음)
+current_user_name = None       # 지금 적용 중인 사용자 이름 (DB에 새로 추가할 때 사용)
+
+# ---------------- 저장 대기 상태 ----------------
+pending_save = False           # 저장 안 된 변경이 있는지
+last_change_time = 0.0         # 마지막으로 EQ를 바꾼 시각 (초)
 
 
 # ---------------- 4) 오디오 장치가 다음 블록을 달라고 할 때마다 호출 ----------------
@@ -162,6 +172,14 @@ def callback(outdata, frames, time_info, status):
 
 
 state_lock = threading.Lock()   # 키보드, 시리얼, MQTT 세 곳에서 동시에 값을 바꾸지 않도록
+save_lock = threading.Lock()    # 저장과 사용자 변경이 동시에 일어나지 않도록
+
+
+def _mark_changed():
+    """노브·키보드로 값이 바뀌었음을 기록 (state_lock 안에서 호출)"""
+    global pending_save, last_change_time
+    pending_save = True
+    last_change_time = time.monotonic()
 
 
 def set_gain(band, delta):
@@ -175,6 +193,7 @@ def _set_gain(band, delta):
     # 새 계수를 다 만든 뒤 한 번에 교체 (콜백이 반쯤 바뀐 값을 읽지 않도록)
     # 필터 상태(zi)는 그대로 두어 소리가 끊기지 않게 함
     sos = build_sos(gains, sr)
+    _mark_changed()
     print(f"{band}: {gains[band]:+.1f} dB")
 
 
@@ -192,6 +211,7 @@ def _set_volume(delta):
     global vol_db
     vol_db = float(np.clip(vol_db + delta, VOL_MIN_DB, VOL_MAX_DB))
     update_target_vol()
+    _mark_changed()
     print(f"volume: {vol_db:+.1f} dB" + (" (음소거 중)" if muted else ""))
 
 
@@ -214,6 +234,38 @@ def apply_eq(eq):
         update_target_vol()
     eq_text = ", ".join(f"{k} {v:+.1f}" for k, v in gains.items())
     print(f"  EQ 적용: {eq_text}, volume {vol_db:+.1f} dB")
+
+
+# ---------------- DB 저장 ----------------
+def _save_current():
+    """현재 사용자의 EQ를 DB에 저장 (save_lock 안에서 호출)"""
+    global pending_save, last_change_time
+    with state_lock:
+        if not pending_save:
+            return
+        pending_save = False
+        user_id, name = current_user_id, current_user_name
+        eq = {**gains, "vol": vol_db}             # 저장할 값을 이 순간 기준으로 복사
+
+    if user_id is None:
+        print("  인식된 사용자가 없어서 저장하지 않음")
+        return
+    try:
+        save_eq(user_id, eq, name)
+        print(f"  저장됨: 사용자 {user_id} ({name})")
+    except Exception as e:                        # DB 접속 실패 등
+        print(f"  저장 실패 ({e}). {SAVE_DELAY}초 뒤 다시 시도")
+        with state_lock:
+            pending_save = True
+            last_change_time = time.monotonic()
+
+
+def saver_loop():
+    """별도 스레드에서 계속 실행: 마지막 조절 후 SAVE_DELAY초가 지나면 저장"""
+    while not finished.wait(0.2):                 # 0.2초마다 확인, 재생이 끝나면 멈춤
+        if pending_save and time.monotonic() - last_change_time >= SAVE_DELAY:
+            with save_lock:
+                _save_current()
 
 
 # ---------------- STM32 시리얼 수신 ----------------
@@ -251,9 +303,17 @@ def serial_listener():
 # ---------------- 젯슨 MQTT 수신 ----------------
 def handle_user(user_id, name):
     """사용자 메시지 처리: 같으면 무시, 다르면 DB에서 불러와 적용, DB에 없으면 기본 EQ"""
-    global current_user_id
+    with save_lock:
+        _handle_user(user_id, name)
+
+
+def _handle_user(user_id, name):
+    global current_user_id, current_user_name
     if user_id == current_user_id:
         return                                    # 같은 사람이면 아무것도 안 함
+
+    # 이전 사용자가 조절하고 아직 저장 안 된 값이 있으면, 바꾸기 전에 이전 사용자에게 먼저 저장
+    _save_current()
 
     print(f"사용자 변경: {current_user_id} -> {user_id} ({name})")
     try:
@@ -267,7 +327,8 @@ def handle_user(user_id, name):
         eq = DEFAULT_EQ
 
     apply_eq(eq)
-    current_user_id = user_id
+    with state_lock:
+        current_user_id, current_user_name = user_id, name
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
@@ -298,6 +359,7 @@ mqtt_client.connect_async(MQTT_HOST, MQTT_PORT)             # 브로커가 아�
 mqtt_client.loop_start()                                    # MQTT 수신을 별도 스레드에서 실행
 
 threading.Thread(target=serial_listener, daemon=True).start()
+threading.Thread(target=saver_loop, daemon=True).start()
 
 
 stream = sd.OutputStream(
@@ -333,5 +395,8 @@ try:
             else:
                 print(f"형식: {names} 숫자 / vol 숫자 / mute")
 finally:
+    finished.set()              # 다른 스레드들에게 종료 알림
+    with save_lock:
+        _save_current()         # 종료 직전에 저장 안 된 변경이 있으면 저장
     mqtt_client.loop_stop()     # 종료할 때 MQTT 스레드 정리
     mqtt_client.disconnect()
