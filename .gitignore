@@ -15,9 +15,6 @@ myenv/
 # 비밀번호가 들어간 설정 파일
 pi/config.py
 
-
-
-*.whl
 jetson/ort.zip
 jetson/dlib
 .vscode/
