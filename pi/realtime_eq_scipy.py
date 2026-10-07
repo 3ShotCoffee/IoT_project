@@ -49,7 +49,7 @@ MQTT_PORT = 1883
 MQTT_TOPIC = "face/user_id"    # 젯슨이 사용자 정보를 올리는 토픽
 
 # 조절이 멈춘 뒤 몇 초 후에 저장할지 (노브를 돌리는 도중에 매번 저장하지 않도록)
-SAVE_DELAY = 1.5
+SAVE_DELAY = 1
 
 # DB에 없는 사용자에게 적용할 기본 EQ
 DEFAULT_EQ = {"low": 0.0, "mid": 0.0, "high": 0.0, "vol": VOL_START_DB}
