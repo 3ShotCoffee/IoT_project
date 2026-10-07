@@ -1,6 +1,6 @@
 
-
-"""실행:
+""""
+실행:
     python3 recognize_and_register.py
     python3 recognize_and_register.py --mqtt
 
@@ -68,26 +68,46 @@ def load_profiles(directory):
 
 def identify(embedding, profiles, threshold):
     """현재 임베딩을 등록 프로필과 비교하고 ID와 최고 점수를 반환합니다."""
-    current = np.asarray(embedding, dtype=np.float32).reshape(-1)
-    norm = np.linalg.norm(current)
-    if norm == 0:
-        return -1, 0.0
-    current = current / norm
+    current = normalize_embedding(embedding)
+    if current is None:
+        return None, None
 
     best_id = -1
-    best_score = -1.0
+    best_score = None
     for user_id, profile in profiles.items():
-        known = profile["embedding"]
+        known = normalize_embedding(profile.get("embedding"))
+        if known is None:
+            continue
         if current.shape != known.shape:
             continue
         # 단위 길이 벡터끼리의 내적은 코사인 유사도입니다.
         score = float(np.dot(current, known))
-        if score > best_score:
+        if best_score is None or score > best_score:
             best_id, best_score = user_id, score
+
+    # 저장된 프로필이 없으면 유효한 얼굴이지만 비교할 등록 사용자가 없습니다.
+    if best_score is None:
+        return (-1, None) if not profiles else (None, None)
 
     if best_score < threshold:
         return -1, best_score
     return best_id, best_score
+
+
+def normalize_embedding(embedding):
+    """벡터가 비교 가능한 숫자인지 확인하고 길이를 1로 맞춥니다."""
+    if embedding is None:
+        return None
+    try:
+        vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if vector.size == 0 or not np.isfinite(vector).all():
+        return None
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm <= 1e-12:
+        return None
+    return vector / norm
 
 
 def register_user(app, cap, args, user_id):
@@ -108,16 +128,22 @@ def register_user(app, cap, args, user_id):
                 return None
 
             photo_frame = frame.copy()
-            faces = app.get(frame)
+            analysis_failed = False
+            try:
+                faces = app.get(frame)
+            except Exception as exc:
+                print("얼굴 분석 실패, 이 프레임은 건너뜁니다: {}".format(exc))
+                faces = []
+                analysis_failed = True
             face = faces[0] if len(faces) == 1 else None
             ready = False
-            status = "Show exactly one face"
+            status = "Analysis failed - frame ignored" if analysis_failed else "Show exactly one face"
             if face is not None:
                 x1, y1, x2, y2 = face.bbox.astype(int)
-                score = float(face.det_score)
-                width, height = x2 - x1, y2 - y1
-                ready = score >= 0.6 and width >= 80 and height >= 80 and has_five_landmarks(face, frame.shape)
-                status = "Ready - move face slowly" if ready else "Face too small / unclear"
+                quality_issue = face_quality_issue(face, frame.shape)
+                ready = quality_issue is None
+                status = "Ready - move face slowly" if ready else "Not ready: {}".format(
+                    quality_issue)
                 cv2.rectangle(frame, (x1, y1), (x2, y2),
                               (0, 220, 0) if ready else (220, 0, 0), 2)
 
@@ -134,19 +160,18 @@ def register_user(app, cap, args, user_id):
             #    print("등록을 취소했습니다. 이번 세션의 사진은 남아 있습니다.")
             #    return None
             if key == ord(" "):
-                if not ready:
+                if analysis_failed or not ready:
                     print("얼굴 한 명이 선명하게 보일 때만 저장할 수 있습니다.")
                     continue
-                vector = np.asarray(face.normed_embedding, dtype=np.float32)
-                norm = np.linalg.norm(vector)
-                if norm == 0:
-                    print("임베딩이 비어 있어 저장하지 않았습니다.")
+                vector = normalize_embedding(getattr(face, "embedding", None))
+                if vector is None:
+                    print("얼굴 벡터가 유효하지 않아 저장하지 않았습니다.")
                     continue
 
                 sample_no = len(embeddings) + 1
                 photo_file = photo_dir / "face_{:03d}.jpg".format(sample_no)
                 if cv2.imwrite(str(photo_file), photo_frame):
-                    embeddings.append(vector / norm)
+                    embeddings.append(vector)
                     print("샘플 {}/{} 저장".format(len(embeddings), args.samples))
                 else:
                     print("사진 저장 실패: {}".format(photo_file))
@@ -210,7 +235,10 @@ def publish_user_id(client, mqtt_module, topic, user_id, similarity):
 
 def has_five_landmarks(face, frame_shape):
     points = getattr(face, "kps", None)
-    if points is None or points.shape != (5, 2):
+    if points is None:
+        return False
+    points = np.asarray(points)
+    if points.shape != (5, 2):
         return False
 
     height, width = frame_shape[:2]
@@ -221,6 +249,36 @@ def has_five_landmarks(face, frame_shape):
         and (points[:, 1] >= 0).all()
         and (points[:, 1] < height).all()
     )
+
+
+def face_quality_issue(face, frame_shape):
+    """비교/등록에 사용할 얼굴과 벡터가 충분히 갖춰졌는지 이유를 반환합니다."""
+    height, width = frame_shape[:2]
+    bbox = getattr(face, "bbox", None)
+    if bbox is None:
+        return "bounding box missing"
+    try:
+        x1, y1, x2, y2 = np.asarray(bbox, dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError):
+        return "invalid bounding box"
+    if not np.isfinite([x1, y1, x2, y2]).all():
+        return "invalid bounding box"
+    if x1 <= 0 or y1 <= 0 or x2 >= width or y2 >= height:
+        return "face touches/crosses frame edge"
+    if x2 - x1 < 80 or y2 - y1 < 80:
+        return "face too small"
+
+    try:
+        det_score = float(getattr(face, "det_score", 0.0))
+    except (TypeError, ValueError):
+        return "invalid detection score"
+    if not np.isfinite(det_score) or det_score < 0.6:
+        return "face detection unclear"
+    if not has_five_landmarks(face, frame_shape):
+        return "five landmarks missing/outside frame"
+    if normalize_embedding(getattr(face, "embedding", None)) is None:
+        return "embedding missing/invalid"
+    return None
 
 def main():
     args = parse_args()
@@ -234,7 +292,6 @@ def main():
     image_dir = Path(args.image_dir)
     image_dir.mkdir(parents=True, exist_ok=True)
     profiles = load_profiles(db_dir)
-
     available = ort.get_available_providers()
     if "CUDAExecutionProvider" not in available:
         raise SystemExit("CUDAExecutionProvider를 사용할 수 없습니다: {}".format(available))
@@ -267,6 +324,7 @@ def main():
     read_sum = get_sum = 0.0
     frame_count = 0
     loop_start = time.perf_counter()
+    analysis_error_reported = False
     print("실시간 식별 시작. Unknown일 때 r: 등록, q: 종료")
     try:
         while True:
@@ -276,7 +334,17 @@ def main():
                 break
 
             t = time.perf_counter()
-            faces = app.get(frame)
+            analysis_failed = False
+            try:
+                faces = app.get(frame)
+                analysis_error_reported = False
+            except Exception as exc:
+                # 얼굴 분석 자체가 실패한 프레임은 Unknown으로 세지 않습니다.
+                faces = []
+                analysis_failed = True
+                if not analysis_error_reported:
+                    print("얼굴 분석 실패, 해당 프레임은 무시합니다: {}".format(exc))
+                    analysis_error_reported = True
             get_sum += time.perf_counter() - t
 
             frame_count += 1
@@ -296,30 +364,55 @@ def main():
             ) if faces else None
 
             best_score = None
-            if face is None:
-                this_candidate = -1
+            quality_issue = None
+            if analysis_failed:
+                this_candidate = None
+                status = "Analysis failed - frame ignored"
+            elif face is None:
+                this_candidate = None
                 status = "No face"
             else:
-                this_candidate, best_score = identify(
-                    face.normed_embedding, profiles, args.threshold)
-                if this_candidate == -1:
-                    status = "Unknown score={:.3f} | R: enroll".format(best_score)
+                quality_issue = face_quality_issue(face, frame.shape)
+                if quality_issue is not None:
+                    this_candidate = None
+                    status = "Ignored: {}".format(quality_issue)
                 else:
-                    status = "ID {} score={:.3f}".format(this_candidate, best_score)
+                    this_candidate, best_score = identify(
+                        getattr(face, "embedding", None), profiles, args.threshold)
+                    if this_candidate is None:
+                        status = "Cannot compare - frame ignored"
+                        quality_issue = "embedding incompatible with profiles"
+                    elif this_candidate == -1:
+                        status = ("Unknown | R: enroll" if best_score is None else
+                                  "Unknown score={:.3f} | R: enroll".format(best_score))
+                    else:
+                        status = "ID {} score={:.3f}".format(this_candidate, best_score)
                 x1, y1, x2, y2 = face.bbox.astype(int)
-                color = (0, 220, 0) if this_candidate != -1 else (0, 0, 255)
+                if this_candidate is None:
+                    color = (0, 200, 255)  # 품질/분석 불충분
+                else:
+                    color = (0, 220, 0) if this_candidate != -1 else (0, 0, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-            if this_candidate == candidate_id:
+            if this_candidate is None:
+                # 얼굴 없음/품질 부족은 Unknown 후보 횟수에 포함하지 않습니다.
+                candidate_id = None
+                candidate_count = 0
+            elif this_candidate == candidate_id:
                 candidate_count += 1
             else:
                 candidate_id = this_candidate
                 candidate_count = 1
 
-            # N 프레임 확인된 새 ID일 때만 터미널/MQTT로 한 번 알립니다.
-            if candidate_count >= args.stable_frames and candidate_id != confirmed_id:
+            # 유효한 얼굴 판정만 안정화한 뒤 터미널/MQTT로 알립니다.
+            if (this_candidate is not None
+                    and candidate_count >= args.stable_frames
+                    and candidate_id != confirmed_id):
                 confirmed_id = candidate_id
-                print("확정 사용자 ID: {}".format(confirmed_id))
+                if confirmed_id == -1:
+                    print("등록된 사용자가 아닙니다. 등록하려면 인식 화면에서 r을 누르세요.")
+                else:
+                    print("확정 사용자 ID: {}".format(confirmed_id))
                 if mqtt_client is not None:
                     publish_user_id(
                         mqtt_client, mqtt_module, args.topic, confirmed_id, best_score)
@@ -336,14 +429,25 @@ def main():
             if key == ord("q"):
                 break
 
-            # 등록은 실제 얼굴이 화면에 있고 현재 Unknown일 때만 시작합니다.
+            # 등록은 품질 검사를 통과한 Unknown 얼굴에 대해서만 시작합니다.
             if key == ord("r"):
-                if (
-                    face is None
-                    or this_candidate != -1
-                    or not has_five_landmarks(face, frame.shape)
-                ):
-                    print("유사도가 기준 이하이고 얼굴 기준점 5개가 모두 화면에 있을 때만 등록할 수 있습니다.")
+                if analysis_failed:
+                    print("얼굴 분석에 실패해 등록할 수 없습니다. 다시 시도하세요.")
+                    continue
+                if face is None:
+                    print("화면에 얼굴이 없어 등록할 수 없습니다.")
+                    continue
+                if quality_issue is not None:
+                    print("얼굴 상태가 불충분해 등록하지 않습니다: {}".format(quality_issue))
+                    continue
+                if this_candidate is None:
+                    print("얼굴 벡터를 비교할 수 없어 등록하지 않습니다.")
+                    continue
+                if this_candidate != -1:
+                    print("이미 등록된 사용자입니다. 새 사용자로 등록하지 않습니다.")
+                    continue
+                if candidate_count < args.stable_frames:
+                    print("Unknown 판정을 확인 중입니다. 잠시 같은 얼굴을 유지한 뒤 다시 누르세요.")
                     continue
                 new_user_id = max(profiles.keys(), default=-1) + 1
                 while (db_dir / "user_{}.npz".format(new_user_id)).exists():
