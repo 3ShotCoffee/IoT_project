@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--camera", type=int, default=0, help="웹캠 인덱스")
     parser.add_argument("--threshold", type=float, default=0.45,
                         help="코사인 유사도 기준 (임시 시작값, 실제 점수로 조정)")
-    parser.add_argument("--stable-frames", type=int, default=5,
+    parser.add_argument("--stable-frames", type=int, default=20,
                         help="같은 ID가 연속 확인되어야 하는 프레임 수")
     parser.add_argument("--samples", type=int, default=5, help="신규 등록 샘플 수")
     parser.add_argument("--det-size", type=int, default=320, help="검출 입력 크기")
@@ -110,7 +110,7 @@ def normalize_embedding(embedding):
     return vector / norm
 
 
-def register_user(app, cap, args, user_id):
+def register_user(app, cap, args, user_id, user_name):
     """Space로 여러 샘플을 모아 사진과 새 사용자 npz를 저장합니다."""
     image_root = Path(args.image_dir) / "user_{}".format(user_id)
     session = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -182,7 +182,7 @@ def register_user(app, cap, args, user_id):
         np.savez_compressed(
             str(profile_file),
             user_id=np.int64(user_id),
-            name=np.asarray("user_{}".format(user_id)),
+            name=np.asarray(user_name),
             embedding=mean_embedding.astype(np.float32),
             sample_count=np.int64(len(embeddings)),
         )
@@ -190,7 +190,7 @@ def register_user(app, cap, args, user_id):
         print("사진 저장: {}".format(photo_dir))
         return {
             "embedding": mean_embedding.astype(np.float32),
-            "name": "user_{}".format(user_id),
+            "name": user_name,
             "file": str(profile_file),
         }
     finally:
@@ -222,10 +222,15 @@ def make_mqtt_client(host, port):
     return client, mqtt
 
 
-def publish_user_id(client, mqtt_module, topic, user_id, similarity):
+def format_user_name(user_id):
+    """사용자 ID를 user_01 형식의 이름으로 바꿉니다."""
+    return "user_{:02d}".format(int(user_id))
+
+
+def publish_user_id(client, mqtt_module, topic, user_id, name):
     payload = json.dumps({
         "user_id": int(user_id),
-        "similarity": None if similarity is None else float(similarity),
+        "name": None if name is None else str(name),
     })
     result = client.publish(topic, payload, qos=1, retain=False)
     if result.rc == mqtt_module.MQTT_ERR_SUCCESS:
@@ -414,8 +419,13 @@ def main():
                 else:
                     print("확정 사용자 ID: {}".format(confirmed_id))
                 if mqtt_client is not None:
+                    if confirmed_id == -1:
+                        published_name = "unknown"
+                    else:
+                        published_name = (profiles.get(confirmed_id, {}).get("name")
+                                           or format_user_name(confirmed_id))
                     publish_user_id(
-                        mqtt_client, mqtt_module, args.topic, confirmed_id, best_score)
+                        mqtt_client, mqtt_module, args.topic, confirmed_id, published_name)
 
             cv2.putText(frame, status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (0, 255, 0), 2)
@@ -449,17 +459,27 @@ def main():
                 if candidate_count < args.stable_frames:
                     print("Unknown 판정을 확인 중입니다. 잠시 같은 얼굴을 유지한 뒤 다시 누르세요.")
                     continue
-                new_user_id = max(profiles.keys(), default=-1) + 1
-                while (db_dir / "user_{}.npz".format(new_user_id)).exists():
+                existing_names = {str(p.get("name", "")) for p in profiles.values()}
+                new_user_id = max(profiles.keys(), default=0) + 1
+                new_user_name = format_user_name(new_user_id)
+                while ((db_dir / "user_{}.npz".format(new_user_id)).exists()
+                       or new_user_name in existing_names):
                     new_user_id += 1
-                print("새 사용자에게 ID {}를 배정합니다.".format(new_user_id))
-                profile = register_user(app, cap, args, new_user_id)
+                    new_user_name = format_user_name(new_user_id)
+                print("새 사용자에게 ID {} / 이름 {}을 배정합니다.".format(
+                    new_user_id, new_user_name))
+                profile = register_user(app, cap, args, new_user_id, new_user_name)
                 if profile is not None:
                     profiles[new_user_id] = profile
-                    # 다음 프레임부터 새 프로필과 비교해 안정화 후 ID를 발행합니다.
                     candidate_id = None
                     candidate_count = 0
-                    print("ID {} 등록됨. 인식 화면으로 돌아갑니다.".format(new_user_id))
+                    confirmed_id = new_user_id
+                    print("ID {} ({}) 등록됨. 인식 화면으로 돌아갑니다.".format(
+                        new_user_id, new_user_name))
+                    if mqtt_client is not None:
+                        publish_user_id(
+                            mqtt_client, mqtt_module, args.topic,
+                            new_user_id, new_user_name)
     finally:
         cap.release()
         cv2.destroyAllWindows()
