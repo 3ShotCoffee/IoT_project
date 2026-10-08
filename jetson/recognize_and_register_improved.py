@@ -270,7 +270,7 @@ def face_quality_issue(face, frame_shape):
         return "face touches/crosses frame edge"
     if x2 - x1 < 80 or y2 - y1 < 80:
         return "face too small"
-        
+    
     try:
         det_score = float(getattr(face, "det_score", 0.0))
     except (TypeError, ValueError):
@@ -431,10 +431,12 @@ def main():
                         status = "ID {} score={:.3f}".format(this_candidate, best_score)
 
                 # 직전 확정 ID의 상자와 현재 상자가 충분히 겹치면 -1을 보류합니다.
+                # 겹치지않으면 -1 -> 0
                 if (this_candidate == -1
                         and confirmed_id is not None
                         and confirmed_id >= 0
-                        and bbox_iou(confirmed_bbox, current_bbox) >= 0.):
+                        and current_bbox is not None
+                        and bbox_iou(confirmed_bbox, current_bbox) >= 0.5):
                         # 겹치는 정도가 0.5 이상일 경우에 -1 보류 
                     temporarily_uncertain = True
                     this_candidate = None
@@ -448,6 +450,8 @@ def main():
                     elif this_candidate != confirmed_id:
                         # 다른 ID가 감지되면 이전 ID의 박스를 더 이상 사용하지 않습니다.
                         confirmed_bbox = None
+                        
+
 
                 if display_bbox is not None:
                     x1, y1, x2, y2 = display_bbox.astype(int)
