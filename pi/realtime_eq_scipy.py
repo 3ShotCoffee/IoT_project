@@ -149,26 +149,21 @@ def callback(outdata, frames, time_info, status):
     if status:
         print("오디오 경고:", status)
 
+    # 곡 끝에 도달하면 남은 부분 + 처음 부분을 이어 붙여서 반복 재생
     chunk = audio[pos:pos + frames]
-    pos += frames
-    n = chunk.shape[0]
-    outdata.fill(0)
-    if n == 0:
-        raise sd.CallbackStop
+    if chunk.shape[0] < frames:
+        pos = frames - chunk.shape[0]
+        chunk = np.concatenate([chunk, audio[:pos]])
+    else:
+        pos += frames
 
-    # zi로 이전 블록의 상태를 넘기고, 이번 블록이 끝난 상태를 다시 받아둠
-    # -> 블록 경계에서 소리가 튀지 않음
     y, zi = sosfilt(sos, chunk, axis=0, zi=zi)
 
-    # 볼륨이 바뀌었으면 이번 블록 안에서 이전 값 -> 새 값으로 서서히 바꿈
-    # (한 번에 바꾸면 "툭" 소리가 날 수 있음)
     new_vol = target_vol
-    ramp = np.linspace(current_vol, new_vol, n, dtype=np.float32)[:, None]
+    ramp = np.linspace(current_vol, new_vol, frames, dtype=np.float32)[:, None]
     current_vol = new_vol
 
-    outdata[:n] = np.clip(y * ramp, -1.0, 1.0).astype(np.float32)
-    if n < frames:
-        raise sd.CallbackStop
+    outdata[:] = np.clip(y * ramp, -1.0, 1.0).astype(np.float32)
 
 
 state_lock = threading.Lock()   # 키보드, 시리얼, MQTT 세 곳에서 동시에 값을 바꾸지 않도록
