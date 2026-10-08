@@ -1,5 +1,6 @@
 cffi==2.1.1
 numpy==2.5.3
+paho-mqtt==2.1.0
 pycparser==3.0
 PyMySQL==1.2.3
 pyserial==3.5
