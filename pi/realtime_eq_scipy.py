@@ -2,6 +2,7 @@
 STM32 엔코더 + 젯슨 얼굴 인식 연동 실시간 EQ 재생 (scipy 버전, 라즈베리파이 + MAX98357A용)
 - STM32가 USB 시리얼로 보내는 "B1:+1" 메시지를 받아 EQ와 볼륨을 조절
   (B1=저음, B2=중음, B3=고음, B4=볼륨 / 한 칸 = STEP_DB 만큼)
+- STM32가 보내는 버튼 메시지 "S1:1"(1번 버튼 눌림)을 받아 MQTT(button)로 젯슨에 전달
 - 젯슨이 MQTT(face/user_id)로 보내는 {"user_id": 1, "name": "user_01"}을 받아
   사용자가 바뀌면 DB에서 그 사람의 EQ를 불러와 적용 (DB에 없으면 기본 EQ)
 - 노브(또는 키보드)로 EQ를 바꾸고 SAVE_DELAY초 동안 추가 조절이 없으면
@@ -43,10 +44,11 @@ SERIAL_BAUD = 115200           # STM32 USART2 설정과 같아야 함
 STEP_DB = 1.0                  # 엔코더 한 칸당 바뀌는 양 (dB)
 ENCODER_MAP = {1: "low", 2: "mid", 3: "high", 4: "vol"}   # 엔코더 번호 -> 조절 대상
 
-# ---------------- MQTT 설정 (젯슨 -> 파이) ----------------
+# ---------------- MQTT 설정 ----------------
 MQTT_HOST = "localhost"        # 브로커(Mosquitto)가 이 라즈베리파이에 있으면 localhost
 MQTT_PORT = 1883
-MQTT_TOPIC = "face/user_id"    # 젯슨이 사용자 정보를 올리는 토픽
+MQTT_TOPIC = "face/user_id"    # 젯슨 -> 파이: 사용자 정보
+MQTT_BUTTON_TOPIC = "button"   # 파이 -> 젯슨: 버튼 눌림
 
 # 조절이 멈춘 뒤 몇 초 후에 저장할지 (노브를 돌리는 도중에 매번 저장하지 않도록)
 SAVE_DELAY = 1
@@ -264,7 +266,8 @@ def saver_loop():
 
 
 # ---------------- STM32 시리얼 수신 ----------------
-MSG_PATTERN = re.compile(r"B(\d+):([+-]?\d+)")   # "B1:+1" 또는 "B1:+1 (cnt=4)" 모두 인식
+ENCODER_PATTERN = re.compile(r"B(\d+):([+-]?\d+)")   # 엔코더: "B1:+1" 또는 "B1:+1 (cnt=4)"
+BUTTON_PATTERN = re.compile(r"S(\d+):1")             # 버튼 눌림: "S1:1"
 
 
 def handle_encoder(num, steps):
@@ -277,6 +280,17 @@ def handle_encoder(num, steps):
         set_gain(target, steps * STEP_DB)
 
 
+def handle_button(num):
+    """버튼 눌림을 MQTT로 젯슨에 전달"""
+    if not mqtt_client.is_connected():
+        # 연결이 끊긴 동안 눌린 버튼은 버림 (재연결 후 한꺼번에 늦게 전달되지 않도록)
+        print(f"버튼 {num} 눌림 -> MQTT 연결 안 됨, 전달하지 않음")
+        return
+    msg = json.dumps({"button": num})
+    mqtt_client.publish(MQTT_BUTTON_TOPIC, msg, qos=1, retain=False)
+    print(f"버튼 {num} 눌림 -> MQTT {MQTT_BUTTON_TOPIC} 전송: {msg}")
+
+
 def serial_listener():
     """별도 스레드에서 계속 실행: 시리얼 한 줄씩 읽어서 처리, 연결이 끊기면 1초 뒤 재연결"""
     while not finished.is_set():
@@ -287,9 +301,13 @@ def serial_listener():
                     line = ser.readline().decode(errors="ignore").strip()
                     if not line:
                         continue                      # 0.5초 동안 메시지 없음
-                    m = MSG_PATTERN.match(line)
+                    m = ENCODER_PATTERN.match(line)
                     if m:
                         handle_encoder(int(m.group(1)), int(m.group(2)))
+                        continue
+                    m = BUTTON_PATTERN.match(line)
+                    if m:
+                        handle_button(int(m.group(1)))
         except serial.SerialException as e:
             print(f"STM32 연결 안 됨 ({e}). 1초 뒤 다시 시도")
             time.sleep(1)
@@ -351,7 +369,7 @@ mqtt_client.on_connect = on_connect
 mqtt_client.on_message = on_message
 mqtt_client.reconnect_delay_set(min_delay=1, max_delay=5)   # 끊기면 1~5초 간격으로 재연결
 mqtt_client.connect_async(MQTT_HOST, MQTT_PORT)             # 브로커가 아직 안 켜져 있어도 멈추지 않음
-mqtt_client.loop_start()                                    # MQTT 수신을 별도 스레드에서 실행
+mqtt_client.loop_start()                                    # MQTT 송수신을 별도 스레드에서 실행
 
 threading.Thread(target=serial_listener, daemon=True).start()
 threading.Thread(target=saver_loop, daemon=True).start()
