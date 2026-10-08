@@ -35,7 +35,8 @@ def parse_args():
                         help="같은 ID가 연속 확인되어야 하는 프레임 수")
     parser.add_argument("--samples", type=int, default=5, help="신규 등록 샘플 수")
     parser.add_argument("--det-size", type=int, default=320, help="검출 입력 크기")
-    parser.add_argument("--mqtt", action="store_true", help="확정 ID를 MQTT로 발행")
+    parser.add_argument( "--no-mqtt", dest="mqtt", action="store_false",help="MQTT 발행 비활성화")
+    parser.set_defaults(mqtt=True)
     parser.add_argument("--broker", default="10.10.16.75", help="MQTT 브로커 주소")
     parser.add_argument("--port", type=int, default=1883, help="MQTT 포트")
     parser.add_argument("--topic", default="face/user_id", help="ID 발행 토픽")
@@ -259,22 +260,22 @@ def face_quality_issue(face, frame_shape):
     height, width = frame_shape[:2]
     bbox = getattr(face, "bbox", None)
     if bbox is None:
-        return "bounding box missing"
+        return "bounding box missing" # 얼굴 영역을 찾을 수 없음
     try:
         x1, y1, x2, y2 = np.asarray(bbox, dtype=np.float32).reshape(-1)
     except (TypeError, ValueError):
-        return "invalid bounding box"
+        return "invalid bounding box" 
     if not np.isfinite([x1, y1, x2, y2]).all():
-        return "invalid bounding box"
+        return "invalid bounding box" # 얼굴 영역 정보를 확인할 수 없음
     if x1 <= 0 or y1 <= 0 or x2 >= width or y2 >= height:
-        return "face touches/crosses frame edge"
-    if x2 - x1 < 80 or y2 - y1 < 80:
-        return "face too small"
+        return "face touches/crosses frame edge" # 얼굴이 화면 가장자리에 닿거나 잘림
+    if x2 - x1 < 80 or y2 - y1 < 80: 
+        return "face too small"  # 얼굴이 너무 작음
     
     try:
         det_score = float(getattr(face, "det_score", 0.0))
     except (TypeError, ValueError):
-        return "invalid detection score"
+        return "invalid detection score" 
     if not np.isfinite(det_score) or det_score < 0.6:
         return "face detection unclear"
     if not has_five_landmarks(face, frame_shape):
