@@ -120,81 +120,79 @@ def register_user(app, cap, args, user_id, user_name):
     embeddings = []
     print("새 사용자 ID {} 등록: 얼굴 각도를 바꾸고 Space를 {}번 누르세요. c: 취소".format(
         user_id, args.samples))
-    try:
-        while len(embeddings) < args.samples:
-            ok, frame = cap.read()
-            if not ok:
-                print("웹캠 프레임을 읽지 못했습니다.")
-                return None
+    
+    while len(embeddings) < args.samples:
+        ok, frame = cap.read()
+        if not ok:
+            print("웹캠 프레임을 읽지 못했습니다.")
+            return None
 
-            photo_frame = frame.copy()
-            analysis_failed = False
-            try:
-                faces = app.get(frame)
-            except Exception as exc:
-                print("얼굴 분석 실패, 이 프레임은 건너뜁니다: {}".format(exc))
-                faces = []
-                analysis_failed = True
-            face = faces[0] if len(faces) == 1 else None
-            ready = False
-            status = "Analysis failed - frame ignored" if analysis_failed else "Show exactly one face"
-            if face is not None:
-                x1, y1, x2, y2 = face.bbox.astype(int)
-                quality_issue = face_quality_issue(face, frame.shape)
-                ready = quality_issue is None
-                status = "Ready - move face slowly" if ready else "Not ready: {}".format(
-                    quality_issue)
-                cv2.rectangle(frame, (x1, y1), (x2, y2),
-                              (0, 220, 0) if ready else (220, 0, 0), 2)
+        photo_frame = frame.copy()
+        analysis_failed = False
+        try:
+            faces = app.get(frame)
+        except Exception as exc:
+            print("얼굴 분석 실패, 이 프레임은 건너뜁니다: {}".format(exc))
+            faces = []
+            analysis_failed = True
+        face = faces[0] if len(faces) == 1 else None
+        ready = False
+        status = "Analysis failed - frame ignored" if analysis_failed else "Show exactly one face"
+        if face is not None:
+            x1, y1, x2, y2 = face.bbox.astype(int)
+            quality_issue = face_quality_issue(face, frame.shape)
+            ready = quality_issue is None
+            status = "Ready - move face slowly" if ready else "Not ready: {}".format(
+                quality_issue)
+            cv2.rectangle(frame, (x1, y1), (x2, y2),
+                            (0, 220, 0) if ready else (220, 0, 0), 2)
 
-            cv2.putText(frame, status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (0, 255, 0), 2)
-            cv2.putText(frame, "Samples: {}/{}".format(len(embeddings), args.samples),
-                        (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-           # cv2.putText(frame, "SPACE: capture | C: cancel", (16, 90),
-            #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.imshow("User enrollment", frame)
+        cv2.putText(frame, status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 0), 2)
+        cv2.putText(frame, "Samples: {}/{}".format(len(embeddings), args.samples),
+                    (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, "SPACE: capture | C / ESC: cancel", (16, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.imshow("Identify / enroll", frame)
 
-            key = cv2.waitKey(1) & 0xFF
-           # if key == ord("c"):
-            #    print("등록을 취소했습니다. 이번 세션의 사진은 남아 있습니다.")
-            #    return None
-            if key == ord(" "):
-                if analysis_failed or not ready:
-                    print("얼굴 한 명이 선명하게 보일 때만 저장할 수 있습니다.")
-                    continue
-                vector = normalize_embedding(getattr(face, "embedding", None))
-                if vector is None:
-                    print("얼굴 벡터가 유효하지 않아 저장하지 않았습니다.")
-                    continue
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("c"), ord("C"), 27):
+            print("등록을 취소했습니다. 인식 화면으로 돌아갑니다. 웹캠은 계속 켜져 있습니다.")
+            return None
+        if key == ord(" "):
+            if analysis_failed or not ready:
+                print("얼굴 한 명이 선명하게 보일 때만 저장할 수 있습니다.")
+                continue
+            vector = normalize_embedding(getattr(face, "embedding", None))
+            if vector is None:
+                print("얼굴 벡터가 유효하지 않아 저장하지 않았습니다.")
+                continue
 
-                sample_no = len(embeddings) + 1
-                photo_file = photo_dir / "face_{:03d}.jpg".format(sample_no)
-                if cv2.imwrite(str(photo_file), photo_frame):
-                    embeddings.append(vector)
-                    print("샘플 {}/{} 저장".format(len(embeddings), args.samples))
-                else:
-                    print("사진 저장 실패: {}".format(photo_file))
+            sample_no = len(embeddings) + 1
+            photo_file = photo_dir / "face_{:03d}.jpg".format(sample_no)
+            if cv2.imwrite(str(photo_file), photo_frame):
+                embeddings.append(vector)
+                print("샘플 {}/{} 저장".format(len(embeddings), args.samples))
+            else:
+                print("사진 저장 실패: {}".format(photo_file))
 
-        mean_embedding = np.mean(np.stack(embeddings), axis=0)
-        mean_embedding /= np.linalg.norm(mean_embedding)
-        profile_file = Path(args.db_dir) / "user_{}.npz".format(user_id)
-        np.savez_compressed(
-            str(profile_file),
-            user_id=np.int64(user_id),
-            name=np.asarray(user_name),
-            embedding=mean_embedding.astype(np.float32),
-            sample_count=np.int64(len(embeddings)),
-        )
-        print("등록 완료: {}".format(profile_file))
-        print("사진 저장: {}".format(photo_dir))
-        return {
-            "embedding": mean_embedding.astype(np.float32),
-            "name": user_name,
-            "file": str(profile_file),
-        }
-    finally:
-        cv2.destroyAllWindows()
+    mean_embedding = np.mean(np.stack(embeddings), axis=0)
+    mean_embedding /= np.linalg.norm(mean_embedding)
+    profile_file = Path(args.db_dir) / "user_{}.npz".format(user_id)
+    np.savez_compressed(
+        str(profile_file),
+        user_id=np.int64(user_id),
+        name=np.asarray(user_name),
+        embedding=mean_embedding.astype(np.float32),
+        sample_count=np.int64(len(embeddings)),
+    )
+    print("등록 완료: {}".format(profile_file))
+    print("사진 저장: {}".format(photo_dir))
+    return {
+        "embedding": mean_embedding.astype(np.float32),
+        "name": user_name,
+        "file": str(profile_file),
+    }
 
 
 def make_mqtt_client(host, port):
@@ -272,7 +270,7 @@ def face_quality_issue(face, frame_shape):
         return "face touches/crosses frame edge"
     if x2 - x1 < 80 or y2 - y1 < 80:
         return "face too small"
-
+        
     try:
         det_score = float(getattr(face, "det_score", 0.0))
     except (TypeError, ValueError):
@@ -284,6 +282,33 @@ def face_quality_issue(face, frame_shape):
     if normalize_embedding(getattr(face, "embedding", None)) is None:
         return "embedding missing/invalid"
     return None
+
+def bbox_iou(box_a, box_b):
+    """두 바운딩 박스가 겹치는 정도를 0~1로 계산합니다."""
+    if box_a is None or box_b is None:
+        return 0.0
+    try:
+        a = np.asarray(box_a, dtype=np.float32).reshape(4)
+        b = np.asarray(box_b, dtype=np.float32).reshape(4) # np 배열로 바꾸고,
+        #소수점 계산이 가능한 숫자 형식으로 변환, 좌표가 숫자 4개로 된 모양인지 맞춤.
+        #숫자로 바꿀 수 없거나, 좌표개수가 맞지않거나, nan이나 무한한 수이면, 0.0 리턴
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(a).all() or not np.isfinite(b).all():
+        return 0.0
+
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3]) #왼쪽위 좌표,오른쪽 아래 좌표  x,y
+    intersection = max(0.0, right - left) * max(0.0, bottom - top) # 겹친영역 계산
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1]) 
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1]) # 두 바운딩 박스 넓이 따로계산
+    union = area_a + area_b - intersection # 계산에서 겹치는 부분을 뻄
+    return float(intersection / union) if union > 0.0 else 0.0 
+    # 겹친 넓이를 전체 넓이로 나눈 값을 리턴, union이 0이면 나눌 수 없으므로 0.0 리턴
+    # 따라서 1.0 = 두박스가 완전히 겹침, 0.0 두박스가 겹치지않음.
+
 
 def main():
     args = parse_args()
@@ -326,6 +351,7 @@ def main():
     candidate_id = None
     candidate_count = 0
     confirmed_id = None
+    confirmed_bbox = None
     read_sum = get_sum = 0.0
     frame_count = 0
     loop_start = time.perf_counter()
@@ -366,10 +392,21 @@ def main():
                 faces,
                 key=lambda item: (item.bbox[2] - item.bbox[0]) *
                                  (item.bbox[3] - item.bbox[1]),
-            ) if faces else None
-
+            ) if faces else None # 많은 얼굴중 가장 큰 얼굴 하나만 선정
+ 
             best_score = None
             quality_issue = None
+            temporarily_uncertain = False
+            current_bbox = None
+            display_bbox = None
+            if face is not None:
+                try:
+                    current_bbox = np.asarray(
+                        face.bbox, dtype=np.float32).reshape(4).copy()
+                    display_bbox = current_bbox
+                except (TypeError, ValueError):
+                    current_bbox = None
+
             if analysis_failed:
                 this_candidate = None
                 status = "Analysis failed - frame ignored"
@@ -392,15 +429,36 @@ def main():
                                   "Unknown score={:.3f} | R: enroll".format(best_score))
                     else:
                         status = "ID {} score={:.3f}".format(this_candidate, best_score)
-                x1, y1, x2, y2 = face.bbox.astype(int)
-                if this_candidate is None:
-                    color = (0, 200, 255)  # 품질/분석 불충분
-                else:
-                    color = (0, 220, 0) if this_candidate != -1 else (0, 0, 255)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                # 직전 확정 ID의 상자와 현재 상자가 충분히 겹치면 -1을 보류합니다.
+                if (this_candidate == -1
+                        and confirmed_id is not None
+                        and confirmed_id >= 0
+                        and bbox_iou(confirmed_bbox, current_bbox) >= 0.):
+                        # 겹치는 정도가 0.5 이상일 경우에 -1 보류 
+                    temporarily_uncertain = True
+                    this_candidate = None
+                    display_bbox = confirmed_bbox.copy()
+                    status = "Temporarily uncertain - keeping ID {}".format(confirmed_id)
+                elif (this_candidate is not None and this_candidate >= 0
+                      and confirmed_id is not None and confirmed_id >= 0):
+                    if this_candidate == confirmed_id and current_bbox is not None:
+                        # 같은 ID가 정상 인식되면 기준 박스를 현재 위치로 갱신합니다.
+                        confirmed_bbox = current_bbox.copy()
+                    elif this_candidate != confirmed_id:
+                        # 다른 ID가 감지되면 이전 ID의 박스를 더 이상 사용하지 않습니다.
+                        confirmed_bbox = None
+
+                if display_bbox is not None:
+                    x1, y1, x2, y2 = display_bbox.astype(int)
+                    if temporarily_uncertain or this_candidate is None:
+                        color = (0, 200, 255)  # 잠시 확인 어려움 또는 분석 불충분
+                    else:
+                        color = (0, 220, 0) if this_candidate != -1 else (0, 0, 255)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
             if this_candidate is None:
-                # 얼굴 없음/품질 부족은 Unknown 후보 횟수에 포함하지 않습니다.
+                # 확인 보류/분석 불충분은 Unknown 연속 횟수에 포함하지 않습니다.
                 candidate_id = None
                 candidate_count = 0
             elif this_candidate == candidate_id:
@@ -409,29 +467,36 @@ def main():
                 candidate_id = this_candidate
                 candidate_count = 1
 
-            # 유효한 얼굴 판정만 안정화한 뒤 터미널/MQTT로 알립니다.
+            # 같은 결과가 충분히 이어졌을 때만 확정합니다. Unknown은 MQTT로 보내지 않습니다.
             if (this_candidate is not None
                     and candidate_count >= args.stable_frames
                     and candidate_id != confirmed_id):
                 confirmed_id = candidate_id
                 if confirmed_id == -1:
+                    confirmed_bbox = None
                     print("등록된 사용자가 아닙니다. 등록하려면 인식 화면에서 r을 누르세요.")
                 else:
+                    if current_bbox is not None:
+                        confirmed_bbox = current_bbox.copy()
                     print("확정 사용자 ID: {}".format(confirmed_id))
-                if mqtt_client is not None:
-                    if confirmed_id == -1:
-                        published_name = "unknown"
-                    else:
-                        published_name = (profiles.get(confirmed_id, {}).get("name")
-                                           or format_user_name(confirmed_id))
-                    publish_user_id(
-                        mqtt_client, mqtt_module, args.topic, confirmed_id, published_name)
+                    if mqtt_client is not None:
+                        published_name = (
+                            profiles.get(confirmed_id, {}).get("name")
+                            or format_user_name(confirmed_id)
+                        )
+                        publish_user_id(
+                            mqtt_client, mqtt_module, args.topic,
+                            confirmed_id, published_name)
 
             cv2.putText(frame, status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (0, 255, 0), 2)
+            confirmed_label = (
+                "ID {} (temporary)".format(confirmed_id) if temporarily_uncertain
+                else "-" if confirmed_id is None else confirmed_id
+            )
             cv2.putText(frame, "Stable: {}/{}  Confirmed: {}".format(
                 min(candidate_count, args.stable_frames), args.stable_frames,
-                "-" if confirmed_id is None else confirmed_id),
+                confirmed_label),
                 (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             cv2.imshow("Identify / enroll", frame)
 
@@ -441,6 +506,9 @@ def main():
 
             # 등록은 품질 검사를 통과한 Unknown 얼굴에 대해서만 시작합니다.
             if key == ord("r"):
+                if temporarily_uncertain:
+                    print("이전 ID를 임시 유지 중이므로 신규 등록을 시작하지 않습니다.")
+                    continue
                 if analysis_failed:
                     print("얼굴 분석에 실패해 등록할 수 없습니다. 다시 시도하세요.")
                     continue
@@ -474,12 +542,19 @@ def main():
                     candidate_id = None
                     candidate_count = 0
                     confirmed_id = new_user_id
+                    if current_bbox is not None:
+                        confirmed_bbox = current_bbox.copy()
                     print("ID {} ({}) 등록됨. 인식 화면으로 돌아갑니다.".format(
                         new_user_id, new_user_name))
                     if mqtt_client is not None:
                         publish_user_id(
                             mqtt_client, mqtt_module, args.topic,
                             new_user_id, new_user_name)
+                else:
+                    # 취소하거나 등록이 끝나지 않았으면 이전 Unknown 횟수를 초기화합니다.
+                    candidate_id = None
+                    candidate_count = 0
+                    print("등록이 완료되지 않았습니다. 인식 화면으로 돌아갑니다.")
     finally:
         cap.release()
         cv2.destroyAllWindows()
