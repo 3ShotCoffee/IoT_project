@@ -13,7 +13,7 @@
 import time
 T_START = time.perf_counter()
 print(f"[시간] import: {time.perf_counter() - T_START:.2f}초")
-
+from queue import Queue, Empty
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +24,7 @@ import numpy as np
 import onnxruntime as ort
 from insightface.app import FaceAnalysis
 
+button_queue = Queue()
 def parse_args():
     parser = argparse.ArgumentParser(description="실시간 얼굴 식별 및 사용자 등록")
     parser.add_argument("--db-dir", default="image_data", help="user_<ID>.npz 등록 폴더")
@@ -33,7 +34,7 @@ def parse_args():
                         help="코사인 유사도 기준 (임시 시작값, 실제 점수로 조정)")
     parser.add_argument("--stable-frames", type=int, default=20,
                         help="같은 ID가 연속 확인되어야 하는 프레임 수")
-    parser.add_argument("--samples", type=int, default=5, help="신규 등록 샘플 수")
+    parser.add_argument("--samples", type=int, default=15, help="신규 등록 샘플 수")
     parser.add_argument("--det-size", type=int, default=320, help="검출 입력 크기")
     parser.add_argument( "--no-mqtt", dest="mqtt", action="store_false",help="MQTT 발행 비활성화")
     parser.set_defaults(mqtt=True)
@@ -119,6 +120,10 @@ def register_user(app, cap, args, user_id, user_name):
     photo_dir.mkdir(parents=True, exist_ok=False)
 
     embeddings = []
+    stable_since = None
+    previous_bbox = None
+    last_capture_bbox = None
+    waiting_for_move = False
     print("새 사용자 ID {} 등록: 얼굴 각도를 바꾸고 Space를 {}번 누르세요. c: 취소".format(
         user_id, args.samples))
     
@@ -145,6 +150,49 @@ def register_user(app, cap, args, user_id, user_name):
             ready = quality_issue is None
             status = "Ready - move face slowly" if ready else "Not ready: {}".format(
                 quality_issue)
+        now = time.monotonic()
+        auto_capture = False
+        current_bbox = None
+
+        if face is not None and ready:
+            current_bbox = np.asarray(
+                face.bbox, dtype=np.float32
+            ).reshape(4).copy()
+
+            if waiting_for_move:
+                if (last_capture_bbox is not None
+                        and bbox_iou(last_capture_bbox, current_bbox) < 0.80):
+                    # 얼굴 위치가 움직였으므로 다음 샘플의 안정 시간 측정을 시작합니다.
+                    waiting_for_move = False
+                    stable_since = now
+                    previous_bbox = current_bbox.copy()
+                    status = "Hold still for 3 seconds"
+                else:
+                    status = "Move face slightly for next sample"
+
+            elif previous_bbox is None:
+                stable_since = now
+                previous_bbox = current_bbox.copy()
+                status = "Hold still for 3 seconds"
+
+            else:
+                overlap = bbox_iou(previous_bbox, current_bbox)
+
+                # 박스가 많이 달라졌으면 움직인 것으로 보고 시간을 다시 셉니다.
+                if overlap < 0.90:
+                    stable_since = now
+
+                previous_bbox = current_bbox.copy()
+                stable_time = now - stable_since
+                auto_capture = stable_time >= 1.0
+                status = "Hold still: {:.1f}/1.0 sec".format(
+                    min(stable_time, 1.0)
+                )
+
+        else:
+            # 얼굴이 없거나 품질 검사를 통과하지 못하면 안정 시간을 다시 셉니다.
+            stable_since = None
+            previous_bbox = None    
             cv2.rectangle(frame, (x1, y1), (x2, y2),
                             (0, 220, 0) if ready else (220, 0, 0), 2)
 
@@ -152,28 +200,45 @@ def register_user(app, cap, args, user_id, user_name):
                     0.6, (0, 255, 0), 2)
         cv2.putText(frame, "Samples: {}/{}".format(len(embeddings), args.samples),
                     (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(frame, "SPACE: capture | C / ESC: cancel", (16, 90),
+        cv2.putText(frame, "Hold still 3 seconds | cancel button 2", (16, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         cv2.imshow("Identify / enroll", frame)
 
         key = cv2.waitKey(1) & 0xFF
-        if key in (ord("c"), ord("C"), 27):
+        button_number = None
+        try:
+            button_number = button_queue.get_nowait()
+        except Empty:
+            pass
+        if button_number == 2:
             print("등록을 취소했습니다. 인식 화면으로 돌아갑니다. 웹캠은 계속 켜져 있습니다.")
             return None
-        if key == ord(" "):
+        if auto_capture:
             if analysis_failed or not ready:
                 print("얼굴 한 명이 선명하게 보일 때만 저장할 수 있습니다.")
                 continue
             vector = normalize_embedding(getattr(face, "embedding", None))
             if vector is None:
                 print("얼굴 벡터가 유효하지 않아 저장하지 않았습니다.")
+                stable_since = None
+                previous_bbox = None
                 continue
 
             sample_no = len(embeddings) + 1
             photo_file = photo_dir / "face_{:03d}.jpg".format(sample_no)
+
             if cv2.imwrite(str(photo_file), photo_frame):
                 embeddings.append(vector)
-                print("샘플 {}/{} 저장".format(len(embeddings), args.samples))
+                last_capture_bbox = current_bbox.copy()
+
+                # 다음 샘플은 얼굴을 움직인 뒤 다시 3초간 멈추면 저장합니다.
+                waiting_for_move = len(embeddings) < args.samples
+                stable_since = None
+                previous_bbox = None
+
+                print("샘플 {}/{} 자동 저장".format(
+                    len(embeddings), args.samples
+                ))
             else:
                 print("사진 저장 실패: {}".format(photo_file))
 
@@ -196,22 +261,35 @@ def register_user(app, cap, args, user_id, user_name):
     }
 
 
-def make_mqtt_client(host, port):
+def make_mqtt_client(host, port, button_queue):
     """--mqtt가 있을 때만 브로커에 연결합니다."""
     try:
         import paho.mqtt.client as mqtt
     except ImportError:
         raise SystemExit("MQTT에는 paho-mqtt가 필요합니다: python -m pip install paho-mqtt")
+    
+    def on_message(client, userdata, msg):
+        try:
+            data = json.loads(msg.payload.decode("utf-8"))
+            button_number = int(data["button"])
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            print("잘못된 버튼 메시지:", msg.payload)
+            return
+
+        if  button_number in (1, 2):
+            button_queue.put(button_number)
 
     def on_connect(client, userdata, flags, rc):
         if rc == 0:
             print("MQTT 연결됨: {}:{}".format(host, port))
+            client.subscribe("button", qos=1)  # 여기서 구독
         else:
             print("MQTT 연결 실패, 결과 코드: {}".format(rc))
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1,
                          client_id="jetson-face-recognizer")
     client.on_connect = on_connect
+    client.on_message = on_message 
     try:
         client.connect(host, port, keepalive=30)
     except OSError as exc:
@@ -336,7 +414,7 @@ def main():
     mqtt_client = None
     mqtt_module = None
     if args.mqtt:
-        mqtt_client, mqtt_module = make_mqtt_client(args.broker, args.port)
+        mqtt_client, mqtt_module = make_mqtt_client(args.broker, args.port, button_queue)
 
     t = time.perf_counter()
     cap = cv2.VideoCapture(args.camera)
@@ -506,8 +584,19 @@ def main():
             cv2.imshow("Identify / enroll", frame)
 
             key = cv2.waitKey(1) & 0xFF
+
+            button_number = None
+            try:
+                button_number = button_queue.get_nowait()
+            except Empty:
+                pass
+
+            if button_number == 1:
+                key = ord("r")
+
             if key == ord("q"):
                 break
+
 
             # 등록은 품질 검사를 통과한 Unknown 얼굴에 대해서만 시작합니다.
             if key == ord("r"):
