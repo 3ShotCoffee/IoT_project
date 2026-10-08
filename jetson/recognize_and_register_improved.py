@@ -259,17 +259,17 @@ def face_quality_issue(face, frame_shape):
     height, width = frame_shape[:2]
     bbox = getattr(face, "bbox", None)
     if bbox is None:
-        return "얼굴 영역을 찾을 수 없습니다"
+        return "bounding box missing"
     try:
         x1, y1, x2, y2 = np.asarray(bbox, dtype=np.float32).reshape(-1)
     except (TypeError, ValueError):
-        return "얼굴 영역 정보를 확인할 수 없습니다"
+        return "invalid bounding box"
     if not np.isfinite([x1, y1, x2, y2]).all():
-        return "얼굴 영역 정보를 확인할 수 없습니다"
+        return "invalid bounding box"
     if x1 <= 0 or y1 <= 0 or x2 >= width or y2 >= height:
-        return "얼굴이 화면 가장자리에 닿거나 잘렸습니다"
+        return "face touches/crosses frame edge"
     if x2 - x1 < 80 or y2 - y1 < 80:
-        return "얼굴이 너무 작습니다"
+        return "face too small"
     
     try:
         det_score = float(getattr(face, "det_score", 0.0))
@@ -435,6 +435,7 @@ def main():
                 if (this_candidate == -1
                         and confirmed_id is not None
                         and confirmed_id >= 0
+                        and current_bbox is not None
                         and bbox_iou(confirmed_bbox, current_bbox) >= 0.5):
                         # 겹치는 정도가 0.5 이상일 경우에 -1 보류 
                     temporarily_uncertain = True
