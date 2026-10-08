@@ -411,6 +411,20 @@ def main():
     app.prepare(ctx_id=0, det_size=(args.det_size, args.det_size))
     print(f"[시간] app.prepare: {time.perf_counter() - t:.2f}초")
     
+    # 모델 미리 돌리기: GPU 준비 시간을 시작 단계에서 끝냄
+    t = time.perf_counter()
+    app.get(np.zeros((args.det_size, args.det_size, 3), dtype=np.uint8))   # 검출 모델
+    rec = app.models.get("recognition")
+    if rec is not None:
+        rec.get_feat(np.zeros((112, 112, 3), dtype=np.uint8))              # 인식 모델
+    print(f"[시간] 모델 준비(warm-up): {time.perf_counter() - t:.2f}초")
+
+    # 화면 창 미리 만들기 (반복문의 imshow와 같은 이름)
+    t = time.perf_counter()
+    cv2.namedWindow("Identify / enroll")
+    cv2.waitKey(1)
+    print(f"[시간] 화면 창 준비: {time.perf_counter() - t:.2f}초")
+
     mqtt_client = None
     mqtt_module = None
     if args.mqtt:
