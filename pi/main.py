@@ -17,6 +17,7 @@ def main():
 
     audio.start(shutdown)
     mqtt_io.start(on_user=audio.handle_user)
+    mqtt_io.start_state_publisher(shutdown, audio.get_state)
     serial_io.start(shutdown, on_encoder=audio.adjust, on_button=mqtt_io.publish_button)
     print("실행 중. Ctrl+C로 종료")
 

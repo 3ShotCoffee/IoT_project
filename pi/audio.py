@@ -7,6 +7,7 @@
     adjust(target, steps)      노브 조절 (target: "low"/"mid"/"high"/"vol")
     handle_user(user_id, name) 사용자 변경 (DB에서 EQ 불러와 적용)
     toggle_mute()              음소거 켜기/끄기
+    get_state()                현재 사용자와 EQ 값 (대시보드 표시용)
 """
 import threading
 import time
@@ -237,6 +238,19 @@ def handle_user(user_id, name):
         with _state_lock:
             _user_id, _user_name = user_id, name
             _pending_save = False             # 이전 사용자 저장이 실패했어도 새 사용자에게 섞이지 않도록
+
+
+# ---------------- 대시보드용 현재 상태 ----------------
+def get_state():
+    """현재 사용자와 EQ, 볼륨 값을 dict로 돌려줌 (이 순간 기준 복사본)"""
+    with _state_lock:
+        return {
+            "user_id": _user_id,
+            "name": _user_name,
+            **_gains,
+            "vol": _vol_db,
+            "muted": _muted,
+        }
 
 
 # ---------------- 시작, 정지 ----------------
