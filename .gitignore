@@ -18,3 +18,4 @@ pi/config.py
 jetson/ort.zip
 jetson/dlib
 .vscode/
+jetson/recognize_and_register_v1.py

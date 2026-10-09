@@ -40,7 +40,9 @@ def parse_args():
     parser.set_defaults(mqtt=True)
     parser.add_argument("--broker", default="10.10.16.75", help="MQTT 브로커 주소")
     parser.add_argument("--port", type=int, default=1883, help="MQTT 포트")
-    parser.add_argument("--topic", default="face/user_id", help="ID 발행 토픽")
+    parser.add_argument("--face_topic", default="face/user_id", help="ID/name 발행 토픽")
+    parser.add_argument("--face_state_topic", default="face/state", help="얼굴 상태 발행 토픽")
+    parser.add_argument( "--face_mode_topic",default="face/mode", help="화면 모드 발행 토픽")
     return parser.parse_args()
 
 
@@ -112,12 +114,13 @@ def normalize_embedding(embedding):
     return vector / norm
 
 
-def register_user(app, cap, args, user_id, user_name):
+def register_user(app, cap, args, user_id, user_name, publish_face_state, publish_face_mode, capture_event_publisher):
     """Space로 여러 샘플을 모아 사진과 새 사용자 npz를 저장합니다."""
     image_root = Path(args.image_dir) / "user_{}".format(user_id)
     session = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     photo_dir = image_root / session
     photo_dir.mkdir(parents=True, exist_ok=False)
+    publish_face_mode("registration")
 
     embeddings = []
     stable_since = None
@@ -131,6 +134,7 @@ def register_user(app, cap, args, user_id, user_name):
         ok, frame = cap.read()
         if not ok:
             print("웹캠 프레임을 읽지 못했습니다.")
+            publish_face_mode("identify")
             return None
 
         photo_frame = frame.copy()
@@ -144,6 +148,7 @@ def register_user(app, cap, args, user_id, user_name):
         face = faces[0] if len(faces) == 1 else None
         ready = False
         status = "Analysis failed - frame ignored" if analysis_failed else "Show exactly one face"
+        quality_issue = None
         if face is not None:
             x1, y1, x2, y2 = face.bbox.astype(int)
             quality_issue = face_quality_issue(face, frame.shape)
@@ -151,6 +156,8 @@ def register_user(app, cap, args, user_id, user_name):
             status = "Ready - move face slowly" if ready else "Not ready: {}".format(
                 quality_issue)
         now = time.monotonic()
+        publish_face_state(get_face_state(analysis_failed, face, quality_issue))
+        
         auto_capture = False
         current_bbox = None
 
@@ -193,8 +200,13 @@ def register_user(app, cap, args, user_id, user_name):
             # 얼굴이 없거나 품질 검사를 통과하지 못하면 안정 시간을 다시 셉니다.
             stable_since = None
             previous_bbox = None    
-            cv2.rectangle(frame, (x1, y1), (x2, y2),
-                            (0, 220, 0) if ready else (220, 0, 0), 2)
+            
+            if face is not None:
+                x1, y1, x2, y2 = face.bbox.astype(int)  
+                cv2.rectangle(
+                    frame, (x1, y1), (x2, y2),
+                    (0, 220, 0) if ready else (220, 0, 0), 2
+                )
 
         cv2.putText(frame, status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (0, 255, 0), 2)
@@ -212,6 +224,7 @@ def register_user(app, cap, args, user_id, user_name):
             pass
         if button_number == 2:
             print("등록을 취소했습니다. 인식 화면으로 돌아갑니다. 웹캠은 계속 켜져 있습니다.")
+            publish_face_mode("identify")
             return None
         if auto_capture:
             if analysis_failed or not ready:
@@ -230,6 +243,7 @@ def register_user(app, cap, args, user_id, user_name):
             if cv2.imwrite(str(photo_file), photo_frame):
                 embeddings.append(vector)
                 last_capture_bbox = current_bbox.copy()
+                capture_event_publisher(len(embeddings), args.samples)
 
                 # 다음 샘플은 얼굴을 움직인 뒤 다시 3초간 멈추면 저장합니다.
                 waiting_for_move = len(embeddings) < args.samples
@@ -254,6 +268,7 @@ def register_user(app, cap, args, user_id, user_name):
     )
     print("등록 완료: {}".format(profile_file))
     print("사진 저장: {}".format(photo_dir))
+    publish_face_mode("identify")
     return {
         "embedding": mean_embedding.astype(np.float32),
         "name": user_name,
@@ -362,6 +377,77 @@ def face_quality_issue(face, frame_shape):
         return "embedding missing/invalid"
     return None
 
+
+def get_face_state(analysis_failed, face, quality_issue):
+    if analysis_failed:
+        return "unclear"
+    if face is None:
+        return "no_face"
+    if quality_issue is None:
+        return "ready"
+    if quality_issue == "face too small":
+        return "too_small"
+    if quality_issue == "face touches/crosses frame edge":
+        return "clipped"
+    return "unclear"
+
+def make_face_state_publisher(client, mqtt_module, topic):
+    last_state = [None]
+
+    def publish_if_changed(state):
+        if client is None or state == last_state[0]:
+            return
+
+        payload = json.dumps({"state": state})
+        result = client.publish(topic, payload, qos=1, retain=True)
+
+        if result.rc == mqtt_module.MQTT_ERR_SUCCESS:
+            print("얼굴 상태 발행: topic={!r}, payload={}".format(
+                topic, payload))
+            last_state[0] = state
+        else:
+            print("얼굴 상태 발행 실패: rc={}".format(result.rc))
+
+    return publish_if_changed
+
+def make_capture_event_publisher(client, mqtt_module, topic):
+    def publish_capture_event(sample, total):
+        if client is None:
+            return
+
+        payload = json.dumps({
+            "state": "photo_captured",
+            "sample": int(sample),
+            "total": int(total),
+        })
+        result = client.publish(topic, payload, qos=1, retain=False)
+
+        if result.rc == mqtt_module.MQTT_ERR_SUCCESS:
+            print("촬영 이벤트 발행: topic={!r}, payload={}".format(topic, payload))
+        else:
+            print("촬영 이벤트 발행 실패: rc={}".format(result.rc))
+
+    return publish_capture_event    
+
+def make_face_mode_publisher(client, mqtt_module, topic):
+    last_mode = [None]
+
+    def publish_if_changed(mode):
+        if client is None or mode == last_mode[0]:
+            return
+
+        payload = json.dumps({"mode": mode})
+        result = client.publish(topic, payload, qos=1, retain=True)
+
+        if result.rc == mqtt_module.MQTT_ERR_SUCCESS:
+            print("화면 모드 발행: topic={!r}, payload={}".format(
+                topic, payload))
+            last_mode[0] = mode
+        else:
+            print("화면 모드 발행 실패: rc={}".format(result.rc))
+
+    return publish_if_changed
+
 def bbox_iou(box_a, box_b):
     """두 바운딩 박스가 겹치는 정도를 0~1로 계산합니다."""
     if box_a is None or box_b is None:
@@ -415,6 +501,14 @@ def main():
     mqtt_module = None
     if args.mqtt:
         mqtt_client, mqtt_module = make_mqtt_client(args.broker, args.port, button_queue)
+
+    publish_face_state = make_face_state_publisher(
+    mqtt_client, mqtt_module, args.face_state_topic)
+    publish_face_mode = make_face_mode_publisher(
+    mqtt_client, mqtt_module, args.face_mode_topic)   
+    publish_capture_event = make_capture_event_publisher(
+    mqtt_client, mqtt_module, args.face_state_topic)    
+    publish_face_mode("identify")
 
     t = time.perf_counter()
     cap = cv2.VideoCapture(args.camera)
@@ -568,7 +662,7 @@ def main():
                             or format_user_name(confirmed_id)
                         )
                         publish_user_id(
-                            mqtt_client, mqtt_module, args.topic,
+                            mqtt_client, mqtt_module, args.face_topic,
                             confirmed_id, published_name)
 
             cv2.putText(frame, status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
@@ -630,7 +724,7 @@ def main():
                     new_user_name = format_user_name(new_user_id)
                 print("새 사용자에게 ID {} / 이름 {}을 배정합니다.".format(
                     new_user_id, new_user_name))
-                profile = register_user(app, cap, args, new_user_id, new_user_name)
+                profile = register_user(app, cap, args, new_user_id, new_user_name, publish_face_state, publish_face_mode, publish_capture_event)
                 if profile is not None:
                     profiles[new_user_id] = profile
                     candidate_id = None
@@ -642,7 +736,7 @@ def main():
                         new_user_id, new_user_name))
                     if mqtt_client is not None:
                         publish_user_id(
-                            mqtt_client, mqtt_module, args.topic,
+                            mqtt_client, mqtt_module, args.face_topic,
                             new_user_id, new_user_name)
                 else:
                     # 취소하거나 등록이 끝나지 않았으면 이전 Unknown 횟수를 초기화합니다.
