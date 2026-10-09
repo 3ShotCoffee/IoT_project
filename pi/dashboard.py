@@ -2,7 +2,7 @@
 라즈베리파이 LCD 대시보드 (오디오 프로그램 main.py와 별도로 실행)
     - EQ, 볼륨, 현재 사용자: MQTT eq/state (main.py가 보냄)
     - 카메라 영상: 젯슨 MJPEG (http://젯슨IP:5000/video)
-    - 등록 모드, 얼굴 상태: MQTT face/mode, face/state (젯슨이 보냄)
+    - 등록 모드, 얼굴 상태, 인식된 사용자: MQTT face/mode, face/state, face/user_id (젯슨이 보냄)
     젯슨 쪽이 아직 없어도 EQ 부분은 동작하고, 영상 자리에는 "카메라 연결 대기"가 표시됨
 
 설치:  sudo apt install python3-pygame python3-paho-mqtt fonts-nanum
@@ -10,41 +10,60 @@
 """
 import io
 import json
+import os
+import re
 import threading
 import time
 import urllib.request
 
+# LCD 화면(Wayland) 지정: SSH로 실행해도 LCD에 뜨도록
+# setdefault는 이미 값이 있으면(LCD 터미널에서 직접 실행한 경우) 그대로 둠
+os.environ.setdefault("WAYLAND_DISPLAY", "wayland-0")
+os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+os.nice(10)     # 실행 우선순위 낮추기 (오디오 프로그램이 먼저 처리되도록). nice -n 10과 같은 효과
+
 import pygame
+from pygame import gfxdraw          # 가장자리를 부드럽게 그리는 원 그리기용
 import paho.mqtt.client as mqtt
 
 # ---------------- 설정값 ----------------
 MQTT_HOST = "localhost"                     # 브로커가 이 라즈베리파이에 있음
-VIDEO_URL = "http://젯슨IP:5000/video"       # 젯슨 MJPEG 주소 (영상이 없으면 None)
-FONT_PATH = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"   # 한글 글꼴
+VIDEO_URL = "http://10.10.16.109:5000/video"       # 젯슨 MJPEG 주소 (영상이 없으면 None)
+#VIDEO_URL = None       # 젯슨 MJPEG 주소 (영상이 없으면 None)
+FONT_PATH = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"        # 한글 글꼴
+FONT_BOLD_PATH = "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"  # 한글 굵은 글꼴
 FPS = 15                                    # 화면 갱신 횟수 (1초당)
-RESULT_SHOW_SEC = 3                         # "등록 완료" 같은 결과 문구를 보여줄 시간
+VIDEO_W, VIDEO_H = 480, 600                 # 카메라 영상 영역 크기 (화면이 이보다 작으면 같은 비율로 줄임)
 
 GAIN_MIN, GAIN_MAX = -12.0, 12.0            # audio.py와 같은 범위
 VOL_MIN, VOL_MAX = -60.0, 0.0
 BANDS = [("low", "저음"), ("mid", "중음"), ("high", "고음")]
 
-# 등록 모드일 때 얼굴 상태별 안내 문구 (젯슨이 보내는 코드 -> 화면 문구)
+# 등록 모드일 때 얼굴 상태별 안내 문구 (젯슨이 보내는 face/state 값 -> 화면 문구)
+# 문장 끝의 ". " 기준으로 줄을 나눠서 표시함
 FACE_MESSAGES = {
-    "ok":      "좋아요! 버튼을 눌러 촬영하세요",
-    "small":   "조금 더 가까이 와 주세요",
-    "edge":    "얼굴을 화면 가운데에 맞춰 주세요",
-    "unclear": "얼굴이 잘 보이지 않아요",
+    "ready":     "얼굴이 잘 인식되고 있어요. 지금 상태를 유지해주세요.",
+    "no_face":   "얼굴이 보이지 않아요. 화면 안으로 들어와 주세요.",
+    "too_small": "얼굴이 너무 작아요. 화면에 가까이 와 주세요.",
+    "clipped":   "얼굴을 화면 가운데에 맞춰 주세요.",
+    "unclear":   "화면이 흐려 얼굴을 인식할 수 없어요.",
 }
-RESULT_MESSAGES = {"done": "사용자 등록이 완료됐어요", "cancelled": "등록을 취소했어요",
-                   "failed": "등록에 실패했어요. 다시 시도해 주세요"}
+REGISTER_TITLE = "얼굴 등록중..."            # 등록 모드일 때 영상 위 빈 공간에 표시
+NO_VIDEO_RATIO = 3 / 4                      # 영상이 없을 때 자리 표시 영역의 세로/가로 비율 (4:3)
 
-# 색 (R, G, B) - 베이지 계열
-BG = (243, 235, 221)        # 배경: 밝은 베이지
-PANEL = (228, 216, 196)     # 영상 자리, 막대 바탕: 진한 베이지
-TEXT = (62, 51, 40)         # 글자: 짙은 갈색
-SUB = (138, 123, 104)       # 보조 글자: 회갈색
-ACCENT = (122, 154, 107)    # EQ, 볼륨 막대와 정상 안내: 차분한 초록
-WARN = (192, 112, 63)       # 주의 안내, 음소거: 테라코타
+# 색 (R, G, B) - 오래된 하이파이 오디오 앞판 느낌의 베이지 계열
+BG = (188, 204, 255)        # 배경: 베이지 앞판
+PANEL = (226, 214, 194)     # 영상 자리, 슬라이더 판: 한 단계 진한 베이지
+SHADOW = (205, 190, 166)    # 손잡이 그림자
+SLOT = (70, 56, 45)         # 슬라이더 홈: 짙은 갈색
+TICK = (176, 160, 138)      # 눈금
+KNOB = (43, 91, 249)        # 손잡이
+TEXT = (46, 38, 31)         # 글자: 짙은 갈색
+SUB = (140, 125, 106)       # 보조 글자: 회갈색
+ACCENT = (111, 145, 255)    # 강조
+VOL_KNOB = (94, 52, 186)    # 볼륨 손잡이: 짙은 보라
+VOL_ACCENT = (176, 146, 255)  # 볼륨 강조: 연보라
+WARN = (164, 74, 63)        # 음소거, 주의: 벽돌색
 MSG_BG = (74, 59, 46)       # 영상 아래 안내 문구 띠: 짙은 갈색
 MSG_OK = (190, 214, 170)    # 안내 띠 위 정상 문구: 밝은 초록
 MSG_WARN = (240, 190, 150)  # 안내 띠 위 주의 문구: 밝은 테라코타
@@ -54,18 +73,18 @@ lock = threading.Lock()
 latest = {
     "eq": None,           # eq/state 메시지 (dict)
     "mode": None,         # face/mode 메시지 (dict)
-    "face": None,         # face/state 코드 (문자열)
+    "face": None,         # face/state 값 (문자열, 예: "ready")
+    "user_name": None,    # face/user_id의 이름
     "jpg": None,          # 가장 최근 영상 한 장 (JPEG 바이트)
     "jpg_new": False,     # 새 영상이 왔는지
     "video_ok": False,    # 영상 연결 상태
-    "result_until": 0.0,  # 결과 문구를 언제까지 보여줄지
 }
 
 
 # ---------------- MQTT 수신 (별도 스레드) ----------------
 def on_connect(client, userdata, flags, *args):
     # paho-mqtt 1.x, 2.x 모두에서 동작하도록 나머지 인자는 *args로 받음
-    client.subscribe([("eq/state", 1), ("face/mode", 1), ("face/state", 1)])
+    client.subscribe([("eq/state", 1), ("face/mode", 1), ("face/state", 1), ("face/user_id", 1)])
 
 
 def on_message(client, userdata, msg):
@@ -75,12 +94,13 @@ def on_message(client, userdata, msg):
             if msg.topic == "eq/state":
                 latest["eq"] = json.loads(text)
             elif msg.topic == "face/mode":
-                mode = json.loads(text)
-                latest["mode"] = mode
-                if mode.get("result"):                         # 등록이 막 끝났으면 결과 문구 표시 시작
-                    latest["result_until"] = time.monotonic() + RESULT_SHOW_SEC
+                latest["mode"] = json.loads(text)             # {"mode": "registration" 또는 "recognize"}
             elif msg.topic == "face/state":
-                latest["face"] = text.strip().strip('"')       # "ok" 또는 ok 둘 다 허용
+                face_state = json.loads(text).get("state")
+                if face_state and face_state != "photo_captured":   # 촬영 완료 메시지는 무시
+                    latest["face"] = face_state
+            elif msg.topic == "face/user_id":
+                latest["user_name"] = json.loads(text).get("name")
     except (ValueError, UnicodeDecodeError) as e:
         print(f"MQTT 메시지 형식 오류: {msg.topic} {msg.payload!r} ({e})")
 
@@ -128,9 +148,9 @@ def video_loop():
 
 
 # ---------------- 화면 그리기 ----------------
-def load_font(size):
+def load_font(size, path=FONT_PATH):
     try:
-        return pygame.font.Font(FONT_PATH, size)
+        return pygame.font.Font(path, size)
     except (FileNotFoundError, OSError):
         return pygame.font.Font(None, size)     # 한글 글꼴이 없으면 기본 글꼴 (한글이 네모로 보임)
 
@@ -141,21 +161,77 @@ def draw_text(screen, font, text, color, pos, center=False):
     screen.blit(surf, rect)
 
 
-def draw_eq_bar(screen, fonts, rect, label, value):
-    """세로 막대 하나: 가운데가 0dB, 위로 올리면 위로, 내리면 아래로 채움"""
+def to_percent(value, vmin, vmax):
+    """vmin~vmax 범위의 값을 0~100% 정수로 바꿈"""
+    ratio = (min(max(value, vmin), vmax) - vmin) / (vmax - vmin)
+    return round(ratio * 100)
+
+
+def aa_circle(screen, color, center, r):
+    """가장자리가 부드러운 꽉 찬 원"""
+    x, y = int(center[0]), int(center[1])
+    gfxdraw.filled_circle(screen, x, y, r, color)
+    gfxdraw.aacircle(screen, x, y, r, color)
+
+
+def draw_slider(screen, fonts, rect, label, value, vmin, vmax, value_text,
+                ticks, zero=None, active=True, knob_color=KNOB, accent_color=ACCENT):
+    """세로 슬라이더 하나: 짙은 홈 위에서 손잡이가 값에 따라 위아래로 움직임
+    ticks: 눈금을 그릴 값 목록, zero: 채움 시작 기준값 (EQ는 0, 볼륨은 None=맨 아래)
+    active=False면 손잡이와 채움을 흐리게 (음소거용)"""
     x, y, w, h = rect
-    bar_top, bar_bottom = y + fonts["s"].get_height() + 8, y + h - fonts["s"].get_height() - 8
-    bar_x, bar_w = x + w // 2 - 14, 28
-    mid = (bar_top + bar_bottom) // 2
-    pygame.draw.rect(screen, PANEL, (bar_x, bar_top, bar_w, bar_bottom - bar_top), border_radius=6)
-    ratio = max(-1.0, min(1.0, value / GAIN_MAX))
-    fill = int(abs(ratio) * (bar_bottom - bar_top) / 2)
-    if fill > 0:
-        top = mid - fill if ratio > 0 else mid
-        pygame.draw.rect(screen, ACCENT, (bar_x, top, bar_w, fill), border_radius=4)
-    pygame.draw.line(screen, SUB, (bar_x - 6, mid), (bar_x + bar_w + 6, mid), 2)
-    draw_text(screen, fonts["s"], f"{value:+.0f} dB", TEXT, (x + w // 2, y + fonts["s"].get_height() // 2), center=True)
-    draw_text(screen, fonts["s"], label, SUB, (x + w // 2, y + h - fonts["s"].get_height() // 2), center=True)
+    cx = x + w // 2
+    vh = fonts["v"].get_height()
+    lh = fonts["s"].get_height()
+    rail_top, rail_bottom = y + vh + 22, y + h - lh - 20
+    knob_r = max(11, min(w // 5, 18))
+
+    def to_y(v):
+        ratio = (min(max(v, vmin), vmax) - vmin) / (vmax - vmin)
+        return int(rail_bottom - ratio * (rail_bottom - rail_top))
+
+    # 눈금: 기준값은 길게
+    for t in ticks:
+        ty = to_y(t)
+        length = 12 if t == zero else 7
+        pygame.draw.line(screen, TICK, (cx - 10 - length, ty), (cx - 10, ty), 2)
+        pygame.draw.line(screen, TICK, (cx + 10, ty), (cx + 10 + length, ty), 2)
+
+    # 홈
+    pygame.draw.rect(screen, SLOT, (cx - 3, rail_top - 4, 6, rail_bottom - rail_top + 8), border_radius=3)
+
+    # 기준값(EQ는 0dB, 볼륨은 맨 아래)에서 손잡이까지 색으로 채움
+    knob_y = to_y(value)
+    base_y = to_y(zero) if zero is not None else rail_bottom + 4
+    fill_color = accent_color if active else SUB
+    top, bottom = min(base_y, knob_y), max(base_y, knob_y)
+    if bottom - top > 0:
+        pygame.draw.rect(screen, fill_color, (cx - 3, top, 6, bottom - top), border_radius=3)
+
+    # 손잡이: 그림자 -> 테두리 -> 상아색 몸체 -> 가운데 점
+    aa_circle(screen, SHADOW, (cx, knob_y + 3), knob_r)
+    aa_circle(screen, fill_color, (cx, knob_y), knob_r)
+    aa_circle(screen, knob_color, (cx, knob_y), knob_r - 3)
+    aa_circle(screen, fill_color, (cx, knob_y), max(2, knob_r // 4))
+
+    draw_text(screen, fonts["v"], value_text, TEXT if active else WARN, (cx, y + vh // 2), center=True)
+    draw_text(screen, fonts["s"], label, SUB, (cx, y + h - lh // 2), center=True)
+
+
+def draw_message_band(screen, fonts, rect, message, color):
+    """영상 아래쪽에 반투명 띠를 깔고 안내 문구를 표시. 문장마다 줄을 나눔"""
+    lines = re.split(r"(?<=\.)\s+", message.strip())
+    font = fonts["msg"]
+    if any(font.size(line)[0] > rect.w - 24 for line in lines):
+        font = fonts["s"]                       # 영상 폭보다 길면 작은 글꼴로
+    line_h = font.get_linesize()
+    band_h = line_h * len(lines) + 20
+    band = pygame.Surface((rect.w, band_h), pygame.SRCALPHA)
+    band.fill((*MSG_BG, 215))                   # 215/255 불투명도: 뒤 영상이 살짝 비침
+    screen.blit(band, (rect.x, rect.bottom - band_h))
+    for i, line in enumerate(lines):
+        y = rect.bottom - band_h + 10 + line_h * i + line_h // 2
+        draw_text(screen, font, line, color, (rect.centerx, y), center=True)
 
 
 def draw(screen, fonts, video_surface, state):
@@ -163,63 +239,81 @@ def draw(screen, fonts, video_surface, state):
     screen.fill(BG)
     pad = int(H * 0.04)
 
-    # ---- 왼쪽: 카메라 영상 ----
-    vid_rect = pygame.Rect(pad, pad, int(W * 0.58) - pad, H - 2 * pad)
-    pygame.draw.rect(screen, PANEL, vid_rect, border_radius=12)
-    if video_surface is not None and state["video_ok"]:
+    # 오른쪽 슬라이더 판의 세로 중심 (영상 중심을 여기에 맞춤)
+    panel_top = pad + fonts["s"].get_height() + fonts["l"].get_height() + 22
+    panel_center_y = (panel_top + H - pad) // 2
+
+    # ---- 왼쪽: 카메라 영상 (최대 VIDEO_W x VIDEO_H, 왼쪽에 pad만큼 여백) ----
+    box_scale = min(1.0, H / VIDEO_H, (W * 0.6) / VIDEO_W)             # 화면이 작으면 비율 유지하며 줄임
+    vw, vh = int(VIDEO_W * box_scale), int(VIDEO_H * box_scale)
+    has_video = video_surface is not None and state["video_ok"]
+    if has_video:
         iw, ih = video_surface.get_size()
-        scale = min(vid_rect.w / iw, vid_rect.h / ih)                   # 비율 유지하며 맞추기
-        img = pygame.transform.scale(video_surface, (int(iw * scale), int(ih * scale)))
-        screen.blit(img, img.get_rect(center=vid_rect.center))
+        scale = min(vw / iw, vh / ih)                                    # 영상 전체가 보이도록 맞춤
+        dw, dh = int(iw * scale), int(ih * scale)
     else:
+        dw, dh = vw, int(vw * NO_VIDEO_RATIO)
+    vid_rect = pygame.Rect(pad, 0, dw, dh)
+    vid_rect.centery = panel_center_y                                     # 영상 중심 = 슬라이더 판 중심
+    vid_rect.top = max(0, vid_rect.top)
+    vid_rect.bottom = min(H, vid_rect.bottom)
+
+    if has_video:
+        img = pygame.transform.smoothscale(video_surface, (dw, dh))
+        screen.blit(img, vid_rect)
+    else:
+        pygame.draw.rect(screen, PANEL, vid_rect)
         draw_text(screen, fonts["m"], "카메라 연결 대기", SUB, vid_rect.center, center=True)
 
-    # 등록 모드일 때만 영상 아래쪽에 안내 문구
-    mode = state["mode"] or {}
-    message, color = None, MSG_OK
-    if time.monotonic() < state["result_until"] and mode.get("result"):
-        message, color = RESULT_MESSAGES.get(mode["result"], ""), MSG_OK
-    elif mode.get("mode") == "register":
-        message = FACE_MESSAGES.get(state["face"], "카메라를 봐 주세요")
-        color = MSG_OK if state["face"] == "ok" else MSG_WARN
-        if mode.get("progress") is not None and mode.get("total"):
-            message += f"  ({mode['progress']}/{mode['total']})"
-    if message:
-        box = pygame.Rect(vid_rect.x, vid_rect.bottom - fonts["m"].get_height() - 24,
-                          vid_rect.w, fonts["m"].get_height() + 24)
-        pygame.draw.rect(screen, MSG_BG, box, border_bottom_left_radius=12, border_bottom_right_radius=12)
-        draw_text(screen, fonts["m"], message, color, box.center, center=True)
+    # ---- 안내 문구 ----
+    eq = state["eq"]
+    if (state["mode"] or {}).get("mode") == "registration":
+        # 등록 모드: 영상 위 빈 공간에 제목, 영상 아래쪽에 얼굴 상태 안내
+        draw_text(screen, fonts["t"], REGISTER_TITLE, TEXT, (vid_rect.centerx, vid_rect.top // 2), center=True)
+        face = state["face"] if state["face"] in FACE_MESSAGES else "no_face"
+        draw_message_band(screen, fonts, vid_rect, FACE_MESSAGES[face],
+                          MSG_OK if face == "ready" else MSG_WARN)
+    #else:
+        # 인식 모드: 인식된 사용자에게 인사
+        #greet_name = state["user_name"] or (eq or {}).get("name")
+        #if greet_name:
+        #    draw_message_band(screen, fonts, vid_rect, f"안녕하세요 {greet_name}님", MSG_OK)
 
     # ---- 오른쪽: 사용자, EQ, 볼륨 ----
     px = vid_rect.right + pad
     pw = W - px - pad
-    eq = state["eq"]
     name = (eq or {}).get("name")
     draw_text(screen, fonts["s"], "현재 사용자", SUB, (px, pad))
-    draw_text(screen, fonts["l"], name if name else "인식 전", TEXT, (px, pad + fonts["s"].get_height() + 4))
+    draw_text(screen, fonts["l"], name if name else "인식 전", TEXT if name else SUB,
+              (px, pad + fonts["s"].get_height() + 4))
 
     if eq is None:
         draw_text(screen, fonts["s"], "EQ 정보 대기 중", SUB, (px, H // 2))
         return
 
-    bars_top = pad + fonts["s"].get_height() + fonts["l"].get_height() + 24
-    vol_h = fonts["s"].get_height() * 2 + 30
-    bars_h = H - bars_top - vol_h - 2 * pad
-    col_w = pw // len(BANDS)
-    for i, (key, label) in enumerate(BANDS):
-        draw_eq_bar(screen, fonts, (px + i * col_w, bars_top, col_w, bars_h), label, float(eq.get(key, 0.0)))
+    # 슬라이더 판: EQ 3개 + 구분선 + 볼륨 1개 (panel_top은 위에서 계산)
+    panel = pygame.Rect(px, panel_top, pw, H - panel_top - pad)
+    pygame.draw.rect(screen, PANEL, panel, border_radius=14)
+    inner = panel.inflate(-16, -28)
+    col_w = inner.w // (len(BANDS) + 1)
 
-    # 볼륨: 가로 막대
-    vy = H - pad - vol_h
+    eq_ticks = [-12, -6, 0, 6, 12]
+    for i, (key, label) in enumerate(BANDS):
+        value = float(eq.get(key, 0.0))
+        draw_slider(screen, fonts, (inner.x + i * col_w, inner.y, col_w, inner.h), label,
+                    value, GAIN_MIN, GAIN_MAX, "0 dB" if round(value) == 0 else f"{value:+.0f} dB",
+                    eq_ticks, zero=0)
+
+    # EQ와 볼륨 사이 구분선
+    div_x = inner.x + len(BANDS) * col_w
+    pygame.draw.line(screen, TICK, (div_x, inner.y + 10), (div_x, inner.bottom - 10), 1)
+
     vol = float(eq.get("vol", VOL_MIN))
     muted = bool(eq.get("muted"))
-    vol_text = "음소거" if muted else f"볼륨 {vol:+.0f} dB"
-    draw_text(screen, fonts["s"], vol_text, WARN if muted else TEXT, (px, vy))
-    bar = pygame.Rect(px, vy + fonts["s"].get_height() + 10, pw, 20)
-    pygame.draw.rect(screen, PANEL, bar, border_radius=10)
-    ratio = 0.0 if muted else (vol - VOL_MIN) / (VOL_MAX - VOL_MIN)
-    if ratio > 0:
-        pygame.draw.rect(screen, ACCENT, (bar.x, bar.y, int(bar.w * ratio), bar.h), border_radius=10)
+    draw_slider(screen, fonts, (div_x, inner.y, col_w, inner.h), "볼륨",
+                vol, VOL_MIN, VOL_MAX, "음소거" if muted else f"{to_percent(vol, VOL_MIN, VOL_MAX)}%",
+                [-60, -45, -30, -15, 0], zero=None, active=not muted,
+                knob_color=VOL_KNOB, accent_color=VOL_ACCENT)
 
 
 # ---------------- 메인 ----------------
@@ -235,7 +329,10 @@ def main():
     except OSError:
         print("한글 글꼴이 없어 기본 글꼴 사용 (한글이 네모로 보임): sudo apt install fonts-nanum")
     fonts = {"s": load_font(max(14, H // 28)), "m": load_font(max(18, H // 20)),
-             "l": load_font(max(24, H // 12))}
+             "v": load_font(max(16, H // 22), FONT_BOLD_PATH),    # 슬라이더 값 숫자
+             "l": load_font(max(24, H // 12), FONT_BOLD_PATH),    # 사용자 이름
+             "t": load_font(max(20, H // 16), FONT_BOLD_PATH),    # "얼굴 등록중..." 제목
+             "msg": load_font(max(16, H // 24))}                   # 영상 아래 안내 문구
 
     client = start_mqtt()
     if VIDEO_URL:
