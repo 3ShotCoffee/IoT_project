@@ -11,6 +11,7 @@
 """
 
 import time
+import threading
 T_START = time.perf_counter()
 print(f"[시간] import: {time.perf_counter() - T_START:.2f}초")
 from queue import Queue, Empty
@@ -23,6 +24,79 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from insightface.app import FaceAnalysis
+from flask import Flask, Response, abort, request
+
+
+# MJPEG는 추론 루프가 읽는 동일 프레임을 재사용합니다. 별도 카메라를 열지 않습니다.
+_mjpeg_condition = threading.Condition()
+_mjpeg_jpeg = None
+_mjpeg_sequence = 0
+_mjpeg_last_encode = 0.0
+_mjpeg_app = Flask(__name__)
+
+
+def update_mjpeg_frame(frame):
+    """현재 카메라 프레임을 최대 초당 10장 JPEG로 공유합니다."""
+    global _mjpeg_jpeg, _mjpeg_sequence, _mjpeg_last_encode
+    now = time.monotonic()
+    if now - _mjpeg_last_encode < 0.1:
+        return
+    _mjpeg_last_encode = now
+
+    resized = cv2.resize(frame, (480, 360))
+    ok, encoded = cv2.imencode(
+        ".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 70]
+    )
+    if not ok:
+        return
+    with _mjpeg_condition:
+        _mjpeg_jpeg = encoded.tobytes()
+        _mjpeg_sequence += 1
+        _mjpeg_condition.notify_all()
+
+
+@_mjpeg_app.route("/video")
+def mjpeg_video():
+    # Jetson의 LAN IP만으로 공개하지 않고, 요청한 Pi IP와 일치할 때만 허용합니다.
+    allowed_ip = _mjpeg_app.config.get("VIDEO_ALLOWED_IP")
+    if not allowed_ip or request.remote_addr != allowed_ip:
+        abort(403)
+
+    def frames():
+        last_sequence = -1
+        while True:
+            with _mjpeg_condition:
+                _mjpeg_condition.wait_for(
+                    lambda: _mjpeg_sequence != last_sequence, timeout=10.0
+                )
+                if _mjpeg_sequence == last_sequence:
+                    continue
+                jpeg = _mjpeg_jpeg
+                last_sequence = _mjpeg_sequence
+            if jpeg is None:
+                continue
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n"
+                   b"Content-Length: " + str(len(jpeg)).encode() +
+                   b"\r\n\r\n" + jpeg + b"\r\n")
+
+    return Response(
+        frames(), mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+def start_mjpeg_server(port, allowed_ip):
+    """Pi 한 대만 접속할 수 있는 MJPEG 서버를 백그라운드에서 시작합니다."""
+    _mjpeg_app.config["VIDEO_ALLOWED_IP"] = allowed_ip
+    server_thread = threading.Thread(
+        target=lambda: _mjpeg_app.run(
+            host="0.0.0.0", port=port, threaded=True,
+            debug=False, use_reloader=False
+        ),
+        name="mjpeg-server", daemon=True
+    )
+    server_thread.start()
+
 
 button_queue = Queue()
 def parse_args():
@@ -43,6 +117,9 @@ def parse_args():
     parser.add_argument("--face_topic", default="face/user_id", help="ID/name 발행 토픽")
     parser.add_argument("--face_state_topic", default="face/state", help="얼굴 상태 발행 토픽")
     parser.add_argument( "--face_mode_topic",default="face/mode", help="화면 모드 발행 토픽")
+    parser.add_argument("--video-port", type=int, default=5000, help="MJPEG 영상 서버 포트")
+    parser.add_argument("--video-allowed-ip", default=None,
+                        help="영상 접속을 허용할 Pi의 IP (미지정 시 MJPEG 비활성화)")
     return parser.parse_args()
 
 
@@ -134,9 +211,10 @@ def register_user(app, cap, args, user_id, user_name, publish_face_state, publis
         ok, frame = cap.read()
         if not ok:
             print("웹캠 프레임을 읽지 못했습니다.")
-            publish_face_mode("identify")
+            publish_face_mode("recognize")
             return None
 
+        update_mjpeg_frame(frame)
         photo_frame = frame.copy()
         analysis_failed = False
         try:
@@ -224,7 +302,7 @@ def register_user(app, cap, args, user_id, user_name, publish_face_state, publis
             pass
         if button_number == 2:
             print("등록을 취소했습니다. 인식 화면으로 돌아갑니다. 웹캠은 계속 켜져 있습니다.")
-            publish_face_mode("identify")
+            publish_face_mode("recognize")
             return None
         if auto_capture:
             if analysis_failed or not ready:
@@ -268,7 +346,7 @@ def register_user(app, cap, args, user_id, user_name, publish_face_state, publis
     )
     print("등록 완료: {}".format(profile_file))
     print("사진 저장: {}".format(photo_dir))
-    publish_face_mode("identify")
+    publish_face_mode("recognize")
     return {
         "embedding": mean_embedding.astype(np.float32),
         "name": user_name,
@@ -522,7 +600,7 @@ def main():
     mqtt_client, mqtt_module, args.face_mode_topic)   
     publish_capture_event = make_capture_event_publisher(
     mqtt_client, mqtt_module, args.face_state_topic)    
-    publish_face_mode("identify")
+    publish_face_mode("recognize")
 
     t = time.perf_counter()
     cap = cv2.VideoCapture(args.camera)
@@ -534,6 +612,13 @@ def main():
             mqtt_client.loop_stop()
             mqtt_client.disconnect()
         raise SystemExit("웹캠을 열 수 없습니다. --camera 값을 확인하세요.")
+
+    if args.video_allowed_ip:
+        start_mjpeg_server(args.video_port, args.video_allowed_ip)
+        print("Pi 전용 MJPEG 영상: http://<Jetson-IP>:{}/video (허용 IP: {})".format(
+            args.video_port, args.video_allowed_ip))
+    else:
+        print("MJPEG 비활성화: Pi 접속 IP를 --video-allowed-ip로 지정하세요.")
 
     candidate_id = None
     candidate_count = 0
@@ -551,6 +636,7 @@ def main():
                 print("웹캠 프레임을 읽지 못했습니다.")
                 break
 
+            update_mjpeg_frame(frame)
             t = time.perf_counter()
             analysis_failed = False
             try:
