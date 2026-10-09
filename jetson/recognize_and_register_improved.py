@@ -734,6 +734,10 @@ def main():
                         color = (0, 220, 0) if this_candidate != -1 else (0, 0, 255)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
+            publish_face_state(
+                get_face_state(analysis_failed, face, quality_issue)
+            )
+
             if this_candidate is None:
                 # 확인 보류/분석 불충분은 Unknown 연속 횟수에 포함하지 않습니다.
                 candidate_id = None
@@ -744,7 +748,7 @@ def main():
                 candidate_id = this_candidate
                 candidate_count = 1
 
-            # 같은 결과가 충분히 이어졌을 때만 확정합니다. Unknown은 MQTT로 보내지 않습니다.
+            # 같은 결과가 충분히 이어졌을 때만 확정하고, ID가 바뀔 때 MQTT로 보냅니다.
             if (this_candidate is not None
                     and candidate_count >= args.stable_frames
                     and candidate_id != confirmed_id):
@@ -752,6 +756,10 @@ def main():
                 if confirmed_id == -1:
                     confirmed_bbox = None
                     print("등록된 사용자가 아닙니다. 등록하려면 인식 화면에서 r을 누르세요.")
+                    if mqtt_client is not None:
+                        publish_user_id(
+                            mqtt_client, mqtt_module, args.face_topic,
+                            -1, None)
                 else:
                     if current_bbox is not None:
                         confirmed_bbox = current_bbox.copy()
