@@ -2,13 +2,17 @@
 MQTT 관리
     받기: face/user_id  {"user_id": 1, "name": "user_01"}  (젯슨 -> 파이)
     보내기: button      {"button": 1}                      (파이 -> 젯슨)
+    보내기: eq/state    {"user_id": 1, "name": "user_01", "low": 3.0, "mid": -1.0,
+                         "high": 2.0, "vol": -12.0, "muted": false}  (파이 -> 젯슨, 대시보드용)
 
 다른 파일에서 쓰는 함수:
     start(on_user)          연결 시작. on_user(user_id, name): 사용자 메시지를 받았을 때 호출
     publish_button(num)     버튼 눌림 보내기
+    start_state_publisher(shutdown, get_state)  EQ 상태가 바뀔 때마다 보내기 시작
     stop()                  연결 정리
 """
 import json
+import threading
 
 import paho.mqtt.client as mqtt     # pip install paho-mqtt
 
@@ -17,6 +21,8 @@ MQTT_HOST = "localhost"        # 브로커(Mosquitto)가 이 라즈베리파이�
 MQTT_PORT = 1883
 USER_TOPIC = "face/user_id"    # 젯슨 -> 파이: 사용자 정보
 BUTTON_TOPIC = "button"        # 파이 -> 젯슨: 버튼 눌림
+EQ_STATE_TOPIC = "eq/state"    # 파이 -> 젯슨: 현재 사용자와 EQ 값 (대시보드용)
+STATE_INTERVAL = 0.1           # EQ 상태 확인 주기 (초). 노브를 빠르게 돌려도 이보다 자주 보내지 않음
 
 _client = None
 _on_user = None
@@ -65,6 +71,25 @@ def publish_button(num):
     msg = json.dumps({"button": num})
     _client.publish(BUTTON_TOPIC, msg, qos=1, retain=False)   # 일회성 사건이라 retain 안 함
     print(f"버튼 {num} 눌림 -> MQTT {BUTTON_TOPIC} 전송: {msg}")
+
+
+def _state_loop(shutdown, get_state):
+    """STATE_INTERVAL마다 상태를 확인해서, 바뀌었을 때만 보냄 (별도 스레드)"""
+    last_sent = None
+    while not shutdown.wait(STATE_INTERVAL):
+        if _client is None or not _client.is_connected():
+            last_sent = None          # 다시 연결되면 현재 상태를 한 번 보내도록
+            continue
+        state = get_state()
+        if state == last_sent:
+            continue
+        # "지금 상태"라서 retain: 젯슨이 나중에 켜져도 바로 현재 값을 받음
+        _client.publish(EQ_STATE_TOPIC, json.dumps(state), qos=1, retain=True)
+        last_sent = state
+
+
+def start_state_publisher(shutdown, get_state):
+    threading.Thread(target=_state_loop, args=(shutdown, get_state), daemon=True).start()
 
 
 def stop():
