@@ -47,6 +47,7 @@ FACE_MESSAGES = {
     "too_small": "얼굴이 너무 작아요. 화면에 가까이 와 주세요.",
     "clipped":   "얼굴을 화면 가운데에 맞춰 주세요.",
     "unclear":   "화면이 흐려 얼굴을 인식할 수 없어요.",
+    "already_registered": "이미 등록된 사용자입니다.",
 }
 REGISTER_TITLE = "얼굴 등록중..."            # 등록 모드일 때 영상 위 빈 공간에 표시
 NO_VIDEO_RATIO = 3 / 4                      # 영상이 없을 때 자리 표시 영역의 세로/가로 비율 (4:3)
