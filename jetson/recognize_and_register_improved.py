@@ -191,7 +191,7 @@ def normalize_embedding(embedding):
     return vector / norm
 
 
-def register_user(app, cap, args, user_id, user_name, publish_face_state, publish_face_mode, capture_event_publisher):
+def register_user(app, cap, args, user_id, user_name, publish_face_state, publish_face_mode, capture_event_publisher, profiles):
     """Space로 여러 샘플을 모아 사진과 새 사용자 npz를 저장합니다."""
     image_root = Path(args.image_dir) / "user_{}".format(user_id)
     session = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -227,22 +227,37 @@ def register_user(app, cap, args, user_id, user_name, publish_face_state, publis
         ready = False
         status = "Analysis failed - frame ignored" if analysis_failed else "Show exactly one face"
         quality_issue = None
+        already_registered = False
+        matched_id = None
         if face is not None:
             x1, y1, x2, y2 = face.bbox.astype(int)
             quality_issue = face_quality_issue(face, frame.shape)
             ready = quality_issue is None
-            status = "Ready - move face slowly" if ready else "Not ready: {}".format(
-                quality_issue)
+            if ready:
+                matched_id, _ = identify(
+                    getattr(face, "embedding", None), profiles, args.threshold)
+                already_registered = matched_id is not None and matched_id >= 0
+
+            if already_registered:
+                status = "Already registered - ID {}".format(matched_id)
+            else:
+                status = "Ready - move face slowly" if ready else "Not ready: {}".format(
+                    quality_issue)
         now = time.monotonic()
-        publish_face_state(get_face_state(analysis_failed, face, quality_issue))
+        face_state = (
+            "already_registered" if already_registered
+            else get_face_state(analysis_failed, face, quality_issue)
+        )
+        publish_face_state(face_state)
         
         auto_capture = False
         current_bbox = None
 
-        if face is not None and ready:
+        if face is not None and ready and not already_registered:
+            #기존 등록된 사용자가 아니고, 얼굴이 하나만 있고, 품질검사 통과했을 때
             current_bbox = np.asarray(
                 face.bbox, dtype=np.float32
-            ).reshape(4).copy()
+            ).reshape(4).copy() 
 
             if waiting_for_move:
                 if (last_capture_bbox is not None
@@ -468,7 +483,7 @@ def get_face_state(analysis_failed, face, quality_issue):
     if quality_issue == "face touches/crosses frame edge":
         return "clipped"
     return "unclear"
-
+    
 def make_face_state_publisher(client, mqtt_module, topic):
     last_state = [None]
 
@@ -832,7 +847,7 @@ def main():
                     new_user_name = format_user_name(new_user_id)
                 print("새 사용자에게 ID {} / 이름 {}을 배정합니다.".format(
                     new_user_id, new_user_name))
-                profile = register_user(app, cap, args, new_user_id, new_user_name, publish_face_state, publish_face_mode, publish_capture_event)
+                profile = register_user(app, cap, args, new_user_id, new_user_name, publish_face_state, publish_face_mode, publish_capture_event, profiles)
                 if profile is not None:
                     profiles[new_user_id] = profile
                     candidate_id = None
