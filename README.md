@@ -1,14 +1,6 @@
 # IoT_project
 
-## 라즈베리파이 환경 설정
-1. OS 패키지: `sudo apt install git libportaudio2 libopenblas0 ffmpeg mariadb-server mosquitto mosquitto-clients`
-2. 가상환경: `python3 -m venv ~/eq-env` → `source ~/eq-env/bin/activate` → `pip install -r requirements.txt`
-3. 오디오: `/boot/firmware/config.txt`에 `dtoverlay=max98357a` 추가, `dtparam=audio=on` 주석 처리, 재부팅
-4. 시리얼 권한: `sudo usermod -aG dialout pi`
-5. DB: 계정 만들기(SQL) → `use audio`
-6. `config.py` 생성 후 비밀번호 입력
-
-   # 사용자 맞춤 스마트 EQ 시스템
+# 사용자 맞춤 스마트 EQ 시스템
 
 얼굴 인식으로 사용자를 구분하고, Raspberry Pi가 해당 사용자에게 저장된
 EQ 프리셋을 적용하는 시스템입니다.
@@ -19,6 +11,14 @@ EQ 프리셋을 적용하는 시스템입니다.
 - **Raspberry Pi**: 전달받은 사용자 ID에 맞춰 EQ 프리셋 적용
 - **통신**: MQTT로 상태와 ID를 주고받고, 필요하면 MJPEG로 카메라 영상을 전달
 
+## 라즈베리파이 환경 설정
+1. OS 패키지: `sudo apt install git libportaudio2 libopenblas0 ffmpeg mariadb-server mosquitto mosquitto-clients`
+2. 가상환경: `python3 -m venv ~/eq-env` → `source ~/eq-env/bin/activate` → `pip install -r requirements.txt`
+3. 오디오: `/boot/firmware/config.txt`에 `dtoverlay=max98357a` 추가, `dtparam=audio=on` 주석 처리, 재부팅
+4. 시리얼 권한: `sudo usermod -aG dialout pi`
+5. DB: 계정 만들기(SQL) → `use audio`
+6. `config.py` 생성 후 비밀번호 입력
+   
 ## Vision 기능
 
 ### 얼굴 검출 및 사용자 식별
