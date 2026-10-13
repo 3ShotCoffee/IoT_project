@@ -45,7 +45,7 @@ def load_eq(user_id):
     return {name: float(value) for name, value in zip(COLUMNS, row)}
 
 
-def save_eq(user_id, eq, name=None):
+def save_eq(user_id, eq, name):
     """사용자의 EQ를 저장. 이미 있으면 값만 바꾸고, 없으면 새로 추가"""
     if name is None:
         name = f"user{user_id}"
@@ -53,6 +53,7 @@ def save_eq(user_id, eq, name=None):
         INSERT INTO user_eq (user_id, name, low_db, mid_db, high_db, vol_db)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
+            name = VALUES
             low_db  = VALUES(low_db),
             mid_db  = VALUES(mid_db),
             high_db = VALUES(high_db),
