@@ -108,7 +108,7 @@ def parse_args():
                         help="코사인 유사도 기준 (임시 시작값, 실제 점수로 조정)")
     parser.add_argument("--stable-frames", type=int, default=20,
                         help="같은 ID가 연속 확인되어야 하는 프레임 수")
-    parser.add_argument("--samples", type=int, default=15, help="신규 등록 샘플 수")
+    parser.add_argument("--samples", type=int, default=5, help="신규 등록 샘플 수")
     parser.add_argument("--det-size", type=int, default=320, help="검출 입력 크기")
     parser.add_argument( "--no-mqtt", dest="mqtt", action="store_false",help="MQTT 발행 비활성화")
     parser.set_defaults(mqtt=True)
@@ -193,6 +193,7 @@ def normalize_embedding(embedding):
 
 def register_user(app, cap, args, user_id, user_name, publish_face_state, publish_face_mode, capture_event_publisher, profiles):
     """Space로 여러 샘플을 모아 사진과 새 사용자 npz를 저장합니다."""
+
     image_root = Path(args.image_dir) / "user_{}".format(user_id)
     session = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     photo_dir = image_root / session
@@ -266,27 +267,27 @@ def register_user(app, cap, args, user_id, user_name, publish_face_state, publis
                     waiting_for_move = False
                     stable_since = now
                     previous_bbox = current_bbox.copy()
-                    status = "Hold still for 3 seconds"
+                    status = "Hold still for 0.5 seconds"
                 else:
                     status = "Move face slightly for next sample"
 
             elif previous_bbox is None:
                 stable_since = now
                 previous_bbox = current_bbox.copy()
-                status = "Hold still for 3 seconds"
+                status = "Hold still for 0.5 seconds"
 
             else:
                 overlap = bbox_iou(previous_bbox, current_bbox)
 
                 # 박스가 많이 달라졌으면 움직인 것으로 보고 시간을 다시 셉니다.
-                if overlap < 0.90:
+                if overlap < 0.80:
                     stable_since = now
 
                 previous_bbox = current_bbox.copy()
                 stable_time = now - stable_since
-                auto_capture = stable_time >= 1.0
-                status = "Hold still: {:.1f}/1.0 sec".format(
-                    min(stable_time, 1.0)
+                auto_capture = stable_time >= 0.5
+                status = "Hold still: {:.1f}/0.5 sec".format(
+                    min(stable_time, 0.5)
                 )
 
         else:
@@ -310,6 +311,8 @@ def register_user(app, cap, args, user_id, user_name, publish_face_state, publis
         cv2.imshow("Identify / enroll", frame)
 
         key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            raise SystemExit(0)
         button_number = None
         try:
             button_number = button_queue.get_nowait()
@@ -483,7 +486,7 @@ def get_face_state(analysis_failed, face, quality_issue):
     if quality_issue == "face touches/crosses frame edge":
         return "clipped"
     return "unclear"
-    
+
 def make_face_state_publisher(client, mqtt_module, topic):
     last_state = [None]
 
