@@ -20,14 +20,29 @@ STM32에 연결된 노브로 EQ를 조절하면 사용자별로 자동 저장됩
 | 3ShotCoffee | Raspberry Pi (오디오·DB·MQTT·대시보드), STM32 (입력 장치) |
 | yh | Jetson Vision (얼굴 인식·등록) |
 
-## 라즈베리파이 환경 설정
-1. OS 패키지: `sudo apt install git libportaudio2 libopenblas0 ffmpeg mariadb-server mosquitto mosquitto-clients`
-2. 가상환경: `python3 -m venv ~/eq-env` → `source ~/eq-env/bin/activate` → `pip install -r requirements.txt`
-3. 오디오: `/boot/firmware/config.txt`에 `dtoverlay=max98357a` 추가, `dtparam=audio=on` 주석 처리, 재부팅
-4. 시리얼 권한: `sudo usermod -aG dialout pi`
-5. DB: 계정 만들기(SQL) → `use audio`
-6. `config.py` 생성 후 비밀번호 입력
-7. 대시보드: `sudo apt install python3-pygame python3-paho-mqtt fonts-nanum`
+## Raspberry Pi 환경 설정
+- OS 패키지: `sudo apt install git libportaudio2 libopenblas0 ffmpeg mariadb-server mosquitto mosquitto-clients`
+- 가상환경: `python3 -m venv ~/eq-env` → `source ~/eq-env/bin/activate` → `pip install -r requirements.txt`
+- 오디오: `/boot/firmware/config.txt`에 `dtoverlay=max98357a` 추가, `dtparam=audio=on` 주석 처리, 재부팅
+- 시리얼 권한: `sudo usermod -aG dialout pi`
+- DB: 계정 만들기(SQL) → `use audio`
+- `config.py` 생성 후 비밀번호 입력
+- 대시보드: `sudo apt install python3-pygame python3-paho-mqtt fonts-nanum`
+ 
+## Jetson Nano 환경 설정
+
+Jetson에서 CUDA를 사용할 수 있는 ONNX Runtime 환경과 프로젝트의
+Python 의존성을 준비해야 합니다. Pi와 Jetson은 같은 MQTT 브로커에
+접속할 수 있어야 합니다.
+
+주요 실행 옵션은 다음과 같습니다.
+
+- `--camera`: 카메라 인덱스
+- `--threshold`: 얼굴 유사도 판정 기준
+- `--stable-frames`: ID 확정에 필요한 연속 프레임 수
+- `--samples`: 사용자 등록 샘플 수
+- `--no-mqtt`: MQTT 비활성화
+- `--video-allowed-ip`: MJPEG 접속을 허용할 Pi 주소
 
 ## Vision 기능
 
@@ -124,21 +139,6 @@ Pi가 이를 MQTT로 Jetson에 전달해 **S1은 등록 시작, S2는 등록 취
 | STM32 | C, STM32CubeIDE / HAL, Nucleo-F411RE |
 | 통신 | MQTT (Mosquitto, Paho MQTT), USB 시리얼 (UART 115200) |
 | 하드웨어 | Jetson, Raspberry Pi, STM32 Nucleo, MAX98357A 앰프, 로터리 엔코더, LCD, 웹캠 |
-
-## 환경 및 설정
-
-Jetson에서 CUDA를 사용할 수 있는 ONNX Runtime 환경과 프로젝트의
-Python 의존성을 준비해야 합니다. Pi와 Jetson은 같은 MQTT 브로커에
-접속할 수 있어야 합니다.
-
-주요 실행 옵션은 다음과 같습니다.
-
-- `--camera`: 카메라 인덱스
-- `--threshold`: 얼굴 유사도 판정 기준
-- `--stable-frames`: ID 확정에 필요한 연속 프레임 수
-- `--samples`: 사용자 등록 샘플 수
-- `--no-mqtt`: MQTT 비활성화
-- `--video-allowed-ip`: MJPEG 접속을 허용할 Pi 주소
 
 ## 실행
 
