@@ -43,7 +43,7 @@ InsightFace의 `buffalo_sc` 모델로 얼굴 임베딩을 만들고,
 확정된 사용자가 잠깐 Unknown으로 판정되더라도 현재 얼굴 박스와
 직전 확정 박스의 IoU가 기준 이상이면 기존 ID를 유지합니다.
 잠깐의 인식 흔들림 때문에 EQ가 바뀌는 현상을 완화하기 위한 보조 처리입니다.
-application/miri-canvas-node
+
 
 ### 신규 사용자 등록
 
