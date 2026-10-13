@@ -53,7 +53,7 @@ def save_eq(user_id, eq, name):
         INSERT INTO user_eq (user_id, name, low_db, mid_db, high_db, vol_db)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
-            name = VALUES
+            name = VALUES(name),
             low_db  = VALUES(low_db),
             mid_db  = VALUES(mid_db),
             high_db = VALUES(high_db),
